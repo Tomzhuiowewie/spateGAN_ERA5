@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""spateGAN-ERA5: ERA5 Precipitation Downscaling CLI.
+"""spateGAN-ERA5：ERA5 降水降尺度命令行工具。
 
-Usage:
+用法：
     uv run main.py --config config/config.yml
     uv run main.py --config config/config.yml --center-lat 50.0 --center-lon 10.0
     uv run main.py --help
@@ -12,14 +12,13 @@ import logging
 import sys
 import warnings
 from pathlib import Path
-
 import yaml
 
-# Setup paths before imports
+# 在导入项目前设置路径
 PROJECT_ROOT = Path(__file__).parent.absolute()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Setup logging
+# 设置日志
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_parser() -> argparse.ArgumentParser:
-    """Create CLI argument parser."""
+    """创建命令行参数解析器。"""
     parser = argparse.ArgumentParser(
         prog="spategan-era5",
         description="Downscale ERA5 precipitation to 2km/10min resolution",
@@ -55,7 +54,7 @@ def create_parser() -> argparse.ArgumentParser:
 
 
 def load_config(config_path: Path) -> dict:
-    """Load configuration from YAML file."""
+    """从 YAML 文件加载配置。"""
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
     
@@ -64,7 +63,7 @@ def load_config(config_path: Path) -> dict:
 
 
 def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
-    """Override config values with CLI arguments."""
+    """用命令行参数覆盖配置值。"""
     overrides = {
         ("data", "input_path"): args.input,
         ("data", "output_utm_path"): args.output_utm,
@@ -86,18 +85,18 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
 
 
 def main() -> int:
-    """Main entry point."""
-    # Parse CLI
+    """主入口函数。"""
+    # 解析命令行参数
     args = create_parser().parse_args()
     
-    # Configure logging
+    # 配置日志
     if args.quiet:
         logging.getLogger().setLevel(logging.ERROR)
         warnings.filterwarnings("ignore")
     elif args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    # Load and merge config
+    # 加载并合并配置
     try:
         config = load_config(PROJECT_ROOT / args.config)
     except (FileNotFoundError, yaml.YAMLError) as e:
@@ -111,9 +110,9 @@ def main() -> int:
                 config["domain"]["center_lon"],
                 config["processing"]["device"])
     
-    # Run pipeline
+    # 运行流水线
     try:
-        from src.spategan_era5.pipeline import run_downscaling_pipeline
+        from pipeline import run_downscaling_pipeline
         run_downscaling_pipeline(config, PROJECT_ROOT)
         return 0
     except FileNotFoundError as e:

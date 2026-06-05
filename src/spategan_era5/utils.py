@@ -1,8 +1,7 @@
 """
-Utility functions for spateGAN-ERA5.
+spateGAN-ERA5 的工具函数。
 
-Contains helper functions for distance calculations, interpolation,
-and filename generation.
+包含距离计算、插值和文件名生成等辅助函数。
 """
 
 import math
@@ -11,40 +10,40 @@ from pathlib import Path
 import pandas as pd
 import torch.nn as nn
 
-# Earth radius in kilometers (WGS84 mean radius)
+# 地球半径，单位为千米（WGS84 平均半径）
 EARTH_RADIUS_KM = 6371.04
 
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Calculate the great-circle distance between two points on Earth.
+    """计算地球上两点之间的大圆距离。
     
-    Uses the Haversine formula for accurate distance calculation on a sphere.
+    使用 Haversine 公式在球面上进行较准确的距离计算。
     
-    Args:
-        lat1: Latitude of first point in degrees.
-        lon1: Longitude of first point in degrees.
-        lat2: Latitude of second point in degrees.
-        lon2: Longitude of second point in degrees.
+    参数：
+        lat1: 第一个点的纬度，单位为度。
+        lon1: 第一个点的经度，单位为度。
+        lat2: 第二个点的纬度，单位为度。
+        lon2: 第二个点的经度，单位为度。
         
-    Returns:
-        Distance between the points in kilometers.
+    返回：
+        两点之间的距离，单位为千米。
     """
 
-    # Convert latitude and longitude from degrees to radians
+    # 将纬度和经度从角度转换为弧度
     lat1_rad = math.radians(lat1)
     lon1_rad = math.radians(lon1)
     lat2_rad = math.radians(lat2)
     lon2_rad = math.radians(lon2)
 
-    # Calculate differences
+    # 计算差值
     dlat = lat2_rad - lat1_rad
     dlon = lon2_rad - lon1_rad
 
-    # Haversine formula
+    # Haversine 公式
     a = math.sin(dlat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-    # Distance in kilometers
+    # 距离，单位为千米
     distance = EARTH_RADIUS_KM * c
 
     return distance
@@ -52,16 +51,16 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 class DataInterpolation(nn.Module):
-    """PyTorch module for interpolating 5D tensor data.
+    """用于插值 5D 张量数据的 PyTorch 模块。
     
-    Handles both 2D (bicubic/bilinear/nearest) and 3D (trilinear) interpolation
-    modes for batch, channel, time, height, width tensors.
+    支持对 batch、channel、time、height、width 张量进行
+    2D（bicubic/bilinear/nearest）和 3D（trilinear）插值。
     
-    Args:
-        size: Target output size (height, width) or (time, height, width).
-        mode: Interpolation mode ('bicubic', 'bilinear', 'nearest', 'trilinear').
-        corners: Whether to align corners in interpolation.
-        antialias: Whether to apply antialiasing.
+    参数：
+        size: 目标输出尺寸（height, width）或（time, height, width）。
+        mode: 插值模式（'bicubic'、'bilinear'、'nearest'、'trilinear'）。
+        corners: 插值时是否对齐角点。
+        antialias: 是否应用抗锯齿。
     """
     
     def __init__(
@@ -79,13 +78,13 @@ class DataInterpolation(nn.Module):
         self.antialias = antialias
 
     def forward(self, x):
-        """Interpolate the input tensor.
+        """对输入张量进行插值。
         
-        Args:
-            x: Input tensor of shape (B, C, T, H, W).
+        参数：
+            x: 形状为 (B, C, T, H, W) 的输入张量。
             
-        Returns:
-            Interpolated tensor.
+        返回：
+            插值后的张量。
         """
         if self.mode in ('bicubic', 'bilinear', 'nearest'):
             b, c, t, w, h = x.size()
@@ -116,19 +115,19 @@ def generate_output_filename(
     model: str = 'spateGAN_ERA5',
 ) -> str:
     """
-    Generate output filename based on parameters.
+    根据参数生成输出文件名。
     
-    Parameters
+    参数
     ----------
     dataset: xr.Dataset
-        Dataset containing time and coordinate information
+        包含时间和坐标信息的数据集
     projection : str
-        Projection type ('latlon' or 'utm')
+        投影类型（'latlon' 或 'utm'）
     
-    Returns
+    返回
     -------
     str
-        Formatted filename
+        格式化后的文件名
     """
     
     center_lat = dataset.attrs['center_lat']
@@ -139,11 +138,11 @@ def generate_output_filename(
     start_date = pd.Timestamp(start_date)
     end_date = pd.Timestamp(end_date)
     
-    # Format lat/lon with sign
+    # 格式化带方向标记的纬度/经度
     lat_str = f"{abs(center_lat):.2f}{'N' if center_lat >= 0 else 'S'}"
     lon_str = f"{abs(center_lon):.2f}{'E' if center_lon >= 0 else 'W'}"
     
-    # Format dates
+    # 格式化日期
     start_str = start_date.strftime('%Y%m%d')
     end_str = end_date.strftime('%Y%m%d')
     if model == 'spateGAN_ERA5':

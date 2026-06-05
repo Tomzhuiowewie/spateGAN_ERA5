@@ -1,0 +1,27 @@
+# Standalone training config for reproducing the paper training process.
+# This does not affect config/config.yml or the existing inference pipeline.
+
+x_path: "data/training_data"
+y_path: "data/training_data"
+x_pattern: "x_train*.nc"
+y_pattern: "y_train*.nc"
+y_variable: "sample_high_res"
+
+# 可选: "gan" 或 "cnn"
+training_method: "gan"
+
+output_dir: "training_reproduction/checkpoints"
+
+batch_size: 9
+max_steps: 200000
+checkpoint_interval: 250
+
+device: "cpu"
+seed: 42
+num_workers: 0
+load_into_memory: false
+
+generator_lr: 0.0001
+discriminator_lr: 0.0002
+l1_weight: 1.0
+ensemble_size: 3

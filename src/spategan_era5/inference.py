@@ -1,23 +1,21 @@
 """
-Inference engine for spateGAN-ERA5 model.
+spateGAN-ERA5 模型推理引擎。
 
-Provides the InferenceEngine class for running model predictions
-with sliding window inference.
+提供 InferenceEngine 类，用于通过滑动窗口推理运行模型预测。
 """
 
 import numpy as np
 import torch
 
 class InferenceEngine:
-    """Inference engine for running spateGAN model predictions.
+    """用于运行 spateGAN 模型预测的推理引擎。
     
-    Handles model loading, tensor conversion, and sliding window inference
-    for precipitation downscaling.
+    处理降水降尺度中的模型加载、张量转换和滑动窗口推理。
     
-    Args:
-        model: PyTorch model for inference.
-        sliding_step: Step size for sliding window (default: 1).
-        device: Torch device to use (auto-detects CUDA if available).
+    参数：
+        model: 用于推理的 PyTorch 模型。
+        sliding_step: 滑动窗口步长（默认：1）。
+        device: 使用的 Torch 设备（如可用则自动检测 CUDA）。
     """
     
     def __init__(
@@ -33,13 +31,13 @@ class InferenceEngine:
         self.model.eval()
 
     def _to_tensor(self, array: np.ndarray | torch.Tensor) -> torch.Tensor:
-        """Convert numpy array or tensor to device tensor.
+        """将 numpy 数组或张量转换为指定设备上的张量。
         
-        Args:
-            array: Input array or tensor.
+        参数：
+            array: 输入数组或张量。
             
-        Returns:
-            Tensor on the configured device.
+        返回：
+            位于配置设备上的张量。
         """
         if isinstance(array, np.ndarray):
             array = torch.from_numpy(array).float()
@@ -53,23 +51,23 @@ class InferenceEngine:
         return_numpy: bool = True,
     ) -> tuple[np.ndarray, ...] | np.ndarray | torch.Tensor:
         """
-        Run inference with sliding windows over time.
+        沿时间维度使用滑动窗口运行推理。
 
-        Args:
-            x: Input of shape (B, C, T, H, W) as torch.Tensor or np.ndarray
-            target: Ground truth target (optional)
-            return_numpy: Whether to return predictions as numpy (True) or torch tensor (False)
+        参数：
+            x: 形状为 (B, C, T, H, W) 的输入，可为 torch.Tensor 或 np.ndarray
+            target: 真值目标（可选）
+            return_numpy: 是否以 numpy 返回预测（True）或以 torch 张量返回（False）
 
-        Returns:
-            Predictions as numpy or torch.Tensor
+        返回：
+            numpy 或 torch.Tensor 形式的预测结果
         """
         x = self._to_tensor(x)
 
-        ## move to separete data processing script
-        # Set values < 0 to 0
+        ## 后续可移动到独立的数据处理脚本
+        # 将小于 0 的值截断为 0
         x = torch.clamp(x, min=0.0)
     
-        # Assert no NaNs in the input
+        # 确认输入中没有 NaN
         if torch.isnan(x).any():
             raise ValueError("Input contains NaNs. Please check the input data.")
         
@@ -96,23 +94,23 @@ class InferenceEngine:
             pred = pred[:, :, first_slice:last_slice]
             predictions.append(pred)
 
-        # Combine predictions
+        # 合并预测结果
         predictions = torch.cat(predictions, dim=2)
 
-        # Apply cropping to target and predictions to remove extended ERA5 informatoin (+-4hr) and boundary areas
+        # 裁剪目标和预测，移除扩展的 ERA5 时间信息（+-4 小时）和边界区域
         if target is not None:
             target = self._to_tensor(target)
             target = target[0, 0, 24:-24, 12:-12, 12:-12]
             target = target[6:-6].cpu()
             predictions = predictions[0, 0, 6:-6, 12:-12, 12:-12]
         else:
-            predictions = predictions[0, 0]  # remove batch,channel
+            predictions = predictions[0, 0]  # 移除 batch 和 channel 维度
 
-        # Input data to target domain
+        # 将输入数据裁剪到目标区域
         x = x.cpu()[0,:,5:-5, 8:-8, 8:-8]
         x = x.sum(dim=0)
         
-       # Return predictions and target in mm/h
+       # 以 mm/h 返回预测和目标
         if return_numpy:
             return predictions.numpy()*6, target.numpy()*6, x.numpy() if target is not None else predictions.numpy()*6
         else:

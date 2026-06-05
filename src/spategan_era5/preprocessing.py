@@ -1,14 +1,14 @@
 """
-Preprocessing module for ERA5 data validation and slicing.
+ERA5 数据校验和切片的预处理模块。
 
-Handles domain size validation and data extraction.
+处理区域大小校验和数据提取。
 """
 
 import numpy as np
 import xarray as xr
 from typing import Tuple
 
-from src.spategan_era5.utils import haversine
+from utils import haversine
 
 
 def validate_patch_extraction(
@@ -22,75 +22,75 @@ def validate_patch_extraction(
     lon_east: float,
 ) -> dict[str, float]:
     """
-    Validate that the data domain is large enough to extract the requested patch.
+    校验数据区域是否足够大，能够提取请求的 patch。
     
-    The patch is extracted centered at (center_lat, center_lon) with a radius of
-    (patch_size_km/2 + patch_padding_km) in all directions to account for lat-lon
-    distortion and ensure coverage after UTM projection.
+    patch 以 (center_lat, center_lon) 为中心提取，在各方向上的半径为
+    (patch_size_km/2 + patch_padding_km)，用于补偿经纬度畸变并确保 UTM
+    投影后的覆盖范围。
     
-    Args:
-        center_lat: Extraction center latitude (degrees)
-        center_lon: Extraction center longitude (degrees)
-        patch_size_km: Base patch size in km (e.g., 672)
-        patch_padding_km: Extra padding for distortion (e.g., 100)
-        lat_south: Southern boundary of available data (degrees)
-        lat_north: Northern boundary of available data (degrees)
-        lon_west: Western boundary of available data (degrees)
-        lon_east: Eastern boundary of available data (degrees)
+    参数：
+        center_lat: 提取中心纬度（度）
+        center_lon: 提取中心经度（度）
+        patch_size_km: 基础 patch 大小，单位为 km（例如 672）
+        patch_padding_km: 用于畸变补偿的额外填充（例如 100）
+        lat_south: 可用数据南边界（度）
+        lat_north: 可用数据北边界（度）
+        lon_west: 可用数据西边界（度）
+        lon_east: 可用数据东边界（度）
     
-    Returns:
-        Dictionary with validation results
+    返回：
+        包含校验结果的字典
     
-    Raises:
-        ValueError: If patch cannot be extracted from available data
+    抛出：
+        ValueError: 无法从可用数据中提取 patch 时抛出
     """
-    # Calculate required radius from center
+    # 计算从中心开始所需的半径
     half_patch_km = patch_size_km / 2.0
     required_radius_km = half_patch_km + patch_padding_km
     
     errors = []
     
-    # First check if center is within data domain
+    # 先检查中心点是否位于数据区域内
     if not (lat_south <= center_lat <= lat_north):
         errors.append(f"Center latitude {center_lat:.2f}° is outside data range [{lat_south:.2f}°, {lat_north:.2f}°]")
     
-    # For longitude, handle wraparound for global data
-    # Normalize to same convention for comparison
+    # 对经度处理全球数据的环绕情况
+    # 规范化到同一约定以便比较
     center_lon_norm = ((center_lon + 180) % 360) - 180
     lon_west_norm = ((lon_west + 180) % 360) - 180
     lon_east_norm = ((lon_east + 180) % 360) - 180
     
-    # Check if it's global longitude data
+    # 检查是否为全球经度数据
     is_global_lon = abs(lon_east - lon_west) > 350
     
     if not is_global_lon:
-        # Regional data: center must be within bounds
+        # 区域数据：中心点必须位于边界内
         if lon_west_norm <= lon_east_norm:
-            # Normal case
+            # 普通情况
             if not (lon_west_norm <= center_lon_norm <= lon_east_norm):
                 errors.append(f"Center longitude {center_lon:.2f}° is outside data range [{lon_west:.2f}°, {lon_east:.2f}°]")
         else:
-            # Wraps around 180° meridian
+            # 跨越 180° 经线
             if not (center_lon_norm >= lon_west_norm or center_lon_norm <= lon_east_norm):
                 errors.append(f"Center longitude {center_lon:.2f}° is outside data range [{lon_west:.2f}°, {lon_east:.2f}°]")
     
     if center_lon > 180:
         errors.append(f"Center longitude {center_lon:.2f}° exceeds 180°. Please use -180 to 180 range.")
     
-    # If center is outside data, fail immediately
+    # 如果中心点在数据范围外，立即失败
     if errors:
         error_msg = "Cannot extract patch:\n  " + "\n  ".join(errors)
         raise ValueError(error_msg)
     
-    # Check distance coverage from center to data boundaries
+    # 检查中心点到数据边界的距离覆盖
     lat_distance_south = haversine(center_lat, 0, lat_south, 0)
     lat_distance_north = haversine(center_lat, 0, lat_north, 0)
     
-    # Check longitude coverage (at center latitude)
+    # 检查经度覆盖（在中心纬度处）
     lon_distance_west = haversine(center_lat, center_lon, center_lat, lon_west)
     lon_distance_east = haversine(center_lat, center_lon, center_lat, lon_east)
     
-    # Validate coverage
+    # 校验覆盖范围
     if lat_distance_south < required_radius_km:
         errors.append(f"Insufficient coverage south: {lat_distance_south:.2f} km < {required_radius_km:.2f} km")
     if lat_distance_north < required_radius_km:
@@ -104,7 +104,7 @@ def validate_patch_extraction(
         error_msg = "Cannot extract patch:\n  " + "\n  ".join(errors)
         raise ValueError(error_msg)
     
-    print(f"✓ Patch validated: center ({center_lat:.2f}°N, {center_lon:.2f}°E), radius {required_radius_km:.0f} km")
+    print(f"✓ patch validated: center ({center_lat:.2f}°N, {center_lon:.2f}°E), radius {required_radius_km:.0f} km")
     
     return {
         "lat_distance_south": lat_distance_south,
@@ -124,55 +124,53 @@ def slice_data_for_projection(
     era5_grid_size_km: float = 25.0,
 ) -> tuple[xr.Dataset, dict]:
     """
-    Slice ERA5 data to extract a centered patch in lat-lon projection.
+    在经纬度投影中切片 ERA5 数据，提取居中的 patch。
     
-    Extracts a patch centered on the specified coordinates that is slightly 
-    larger than the target domain size (672×672 km). This is done in lat-lon 
-    projection before any UTM conversion.
+    以指定坐标为中心提取一个略大于目标区域大小（672×672 km）的 patch。
+    该步骤在任何 UTM 转换之前，于经纬度投影中完成。
     
-    Uses Haversine distance to calculate required pixels accounting for
-    latitude-dependent longitude spacing. Handles global data with longitude
-    wrapping (0-360 or -180-180).
+    使用 Haversine 距离计算所需像素数，并考虑经度间距随纬度变化的特性。
+    支持处理具有经度环绕的全球数据（0-360 或 -180-180）。
     
-    Strategy:
-    1. Calculate actual lat/lon spacing using Haversine at center coordinates
-    2. For latitude: use spacing at center_lat
-    3. For longitude: use spacing at center_lat (longitude compression applies at any latitude)
-    4. Add padding: pixels = ceil(domain_km/2 / spacing) * 2 + padding
-    5. Extract rectangular patch centered at (center_lat, center_lon)
+    策略：
+    1. 在中心坐标处使用 Haversine 计算实际经纬度间距
+    2. 纬度方向：使用 center_lat 处的间距
+    3. 经度方向：使用 center_lat 处的间距（经度压缩与纬度相关）
+    4. 添加填充：pixels = ceil(domain_km/2 / spacing) * 2 + padding
+    5. 提取以 (center_lat, center_lon) 为中心的矩形 patch
     
-    Args:
-        ds: Input xarray Dataset with lat/lon coordinates
-        center_lat: Center latitude for extraction (degrees)
-        center_lon: Center longitude for extraction (degrees)
-        target_domain_size_km: Target domain size in km (e.g., 672)
-        extra_padding_cells: Extra cells for padding (default 2)
-        era5_grid_size_km: ERA5 baseline grid resolution in km (~25 km) - used as fallback
+    参数：
+        ds: 带经纬度坐标的输入 xarray Dataset
+        center_lat: 提取中心纬度（度）
+        center_lon: 提取中心经度（度）
+        target_domain_size_km: 目标区域大小，单位 km（例如 672）
+        extra_padding_cells: 额外填充单元数（默认 2）
+        era5_grid_size_km: ERA5 基准网格分辨率，单位 km（约 25 km），作为兜底值
     
-    Returns:
-        Tuple of (sliced_dataset, slicing_info_dict)
-        - sliced_dataset: xr.Dataset with shape (N_lat, N_lon, time)
-        - slicing_info_dict: Dict with metadata about the extraction
+    返回：
+        (sliced_dataset, slicing_info_dict) 元组
+        - sliced_dataset: 形状为 (N_lat, N_lon, time) 的 xr.Dataset
+        - slicing_info_dict: 包含提取元数据的字典
     """
-    # Get coordinate arrays
+    # 获取坐标数组
     lat_coords = ds.coords['lat'].values
     lon_coords = ds.coords['lon'].values
     
-    # Find indices closest to center coordinates
+    # 查找最接近中心坐标的索引
     center_lat_idx = np.argmin(np.abs(lat_coords - center_lat))
     center_lon_idx = np.argmin(np.abs(lon_coords - center_lon))
     
-    # Half-domain size in km
+    # 半区域大小，单位 km
     half_domain_km = target_domain_size_km / 2.0
     
-    # ===== LATITUDE SPACING =====
-    # Calculate actual spacing between consecutive latitude indices at center
+    # ===== 纬度间距 =====
+    # 计算中心附近相邻纬度索引之间的实际间距
     if center_lat_idx > 0 and center_lat_idx < len(lat_coords) - 1:
         lat1 = lat_coords[center_lat_idx]
         lat2 = lat_coords[center_lat_idx - 1]
         lat_spacing_km = haversine(lat1, 0, lat2, 0)
     else:
-        # Fallback: use the spacing at available adjacent index
+        # 兜底：使用可用相邻索引处的间距
         if center_lat_idx < len(lat_coords) - 1:
             lat1 = lat_coords[center_lat_idx]
             lat2 = lat_coords[center_lat_idx + 1]
@@ -180,20 +178,20 @@ def slice_data_for_projection(
         else:
             lat_spacing_km = era5_grid_size_km
     
-    # Latitude pixels needed (in each direction from center)
+    # 所需纬度像素数（从中心向每个方向）
     lat_pixels_half = int(np.ceil(half_domain_km / lat_spacing_km))
-    # padding applies to each side (top and bottom)
+    # 填充应用于两侧（上、下）
     lat_pixels_total = lat_pixels_half * 2 + extra_padding_cells * 2
     
-    # ===== LONGITUDE SPACING =====
-    # Calculate actual spacing between consecutive longitude indices at center_lat
-    # (longitude spacing depends on latitude: cos(lat) factor)
+    # ===== 经度间距 =====
+    # 计算 center_lat 处相邻经度索引之间的实际间距
+    # （经度间距依赖纬度，即 cos(lat) 因子）
     if center_lon_idx > 0 and center_lon_idx < len(lon_coords) - 1:
         lon1 = lon_coords[center_lon_idx]
         lon2 = lon_coords[center_lon_idx - 1]
         lon_spacing_km = haversine(center_lat, lon1, center_lat, lon2)
     else:
-        # Fallback: use spacing at available adjacent index
+        # 兜底：使用可用相邻索引处的间距
         if center_lon_idx < len(lon_coords) - 1:
             lon1 = lon_coords[center_lon_idx]
             lon2 = lon_coords[center_lon_idx + 1]
@@ -201,35 +199,35 @@ def slice_data_for_projection(
         else:
             lon_spacing_km = era5_grid_size_km * np.cos(np.radians(center_lat))
     
-    # Ensure we don't divide by zero for polar regions
+    # 避免在极区出现除零
     if lon_spacing_km < 1e-6:
-        lon_spacing_km = 0.1  # Near pole, use a small positive value
+        lon_spacing_km = 0.1  # 接近极点时使用一个小的正值
     
-    # Longitude pixels needed (in each direction from center)
+    # 所需经度像素数（从中心向每个方向）
     lon_pixels_half = int(np.ceil(half_domain_km / lon_spacing_km))
-    # padding applies to each side (left and right)
+    # 填充应用于两侧（左、右）
     lon_pixels_total = lon_pixels_half * 2 + extra_padding_cells * 2
     
-    # ===== EXTRACT PATCH =====
-    # Calculate slice indices for latitude (straightforward)
-    # apply padding on both sides
+    # ===== 提取 PATCH =====
+    # 计算纬度方向的切片索引（直接处理）
+    # 在两侧应用填充
     lat_idx_start = center_lat_idx - lat_pixels_half - extra_padding_cells
     lat_idx_end = center_lat_idx + lat_pixels_half + extra_padding_cells + (lat_pixels_total % 2)
     
-    # Clamp latitude to valid range
+    # 将纬度限制到有效范围
     lat_idx_start = max(0, lat_idx_start)
     lat_idx_end = min(len(lat_coords), lat_idx_end)
     
-    # For longitude, handle global wrapping (for data with lon 0-360 or -180-180)
+    # 对经度处理全球环绕（适用于 lon 0-360 或 -180-180 的数据）
     is_global_lon = (len(lon_coords) > 100) and (lon_coords[-1] - lon_coords[0] > 350)
     
     if is_global_lon:
-        # Global data: allow wrapping around and apply padding on both sides
+        # 全球数据：允许环绕，并在两侧应用填充
         lon_idx_start = (center_lon_idx - lon_pixels_half - extra_padding_cells) % len(lon_coords)
         lon_idx_end = (center_lon_idx + lon_pixels_half + extra_padding_cells + (lon_pixels_total % 2)) % len(lon_coords)
         
         if lon_idx_end < lon_idx_start:
-            # Wrapping around the dateline
+            # 跨越日期变更线
             ds_sliced = xr.concat([
                 ds.isel(lat=slice(lat_idx_start, lat_idx_end),
                        lon=slice(lon_idx_start, None)),
@@ -240,14 +238,14 @@ def slice_data_for_projection(
             ds_sliced = ds.isel(lat=slice(lat_idx_start, lat_idx_end),
                                lon=slice(lon_idx_start, lon_idx_end))
     else:
-        # Limited longitude range: clamp without wrapping
+        # 有限经度范围：不环绕，直接裁剪到边界
         lon_idx_start = max(0, center_lon_idx - lon_pixels_half - extra_padding_cells)
         lon_idx_end = min(len(lon_coords), center_lon_idx + lon_pixels_half + extra_padding_cells + (lon_pixels_total % 2))
         
         ds_sliced = ds.isel(lat=slice(lat_idx_start, lat_idx_end),
                            lon=slice(lon_idx_start, lon_idx_end))
     
-    # Compile slicing information
+    # 汇总切片信息
     slicing_info = {
         "center_lat": center_lat,
         "center_lon": center_lon,
@@ -271,15 +269,15 @@ def slice_data_for_projection(
 
 def calculate_domain_center(ds: xr.Dataset) -> Tuple[float, float]:
     """
-    Calculate the center coordinates of the sliced domain.
+    计算切片区域的中心坐标。
     
-    Uses the geographic center of the provided dataset coordinates.
+    使用给定数据集坐标的地理中心。
     
-    Args:
-        ds: xarray Dataset with lat/lon coordinates (typically sliced data)
+    参数：
+        ds: 带经纬度坐标的 xarray Dataset（通常是已切片数据）
     
-    Returns:
-        Tuple of (center_lat, center_lon)
+    返回：
+        (center_lat, center_lon) 元组
     """
     lat_coords = ds.coords['lat'].values
     lon_coords = ds.coords['lon'].values
@@ -292,19 +290,19 @@ def calculate_domain_center(ds: xr.Dataset) -> Tuple[float, float]:
 
 def validate_time_dimension(ds: xr.Dataset, required_hours: int = 16) -> bool:
     """
-    Validate that the dataset has enough time steps.
+    校验数据集是否包含足够的时间步。
     
-    For a 16-hour requirement, we need 16 hourly time steps.
+    对于 16 小时需求，需要 16 个逐小时时间步。
     
-    Args:
-        ds: Input dataset
-        required_hours: Number of required hours
+    参数：
+        ds: 输入数据集
+        required_hours: 所需小时数
     
-    Returns:
-        True if valid, raises ValueError otherwise
+    返回：
+        有效时返回 True，否则抛出 ValueError
     
-    Raises:
-        ValueError: If insufficient time steps
+    抛出：
+        ValueError: 时间步不足时抛出
     """
     if 'time' not in ds.dims:
         raise ValueError("Dataset must have a 'time' dimension")
@@ -316,7 +314,7 @@ def validate_time_dimension(ds: xr.Dataset, required_hours: int = 16) -> bool:
             f"Dataset has {n_time_steps} time steps but {required_hours} are required"
         )
     
-    # Warning for large datasets (>1 month ~ 720 hours)
+    # 针对大数据集发出警告（>1 个月，约 720 小时）
     if n_time_steps > 720:
         print(f"⚠ Warning: Large dataset with {n_time_steps} time steps (~{n_time_steps/24:.1f} days) may cause memory issues")
     
@@ -329,14 +327,14 @@ def extract_time_window(
     n_hours: int
 ) -> xr.Dataset:
     """
-    Extract a specific time window from the dataset.
+    从数据集中提取指定时间窗口。
     
-    Args:
-        ds: Input dataset
-        start_idx: Starting time index
-        n_hours: Number of hours to extract
+    参数：
+        ds: 输入数据集
+        start_idx: 起始时间索引
+        n_hours: 要提取的小时数
     
-    Returns:
-        Sliced dataset with the specified time window
+    返回：
+        包含指定时间窗口的切片数据集
     """
     return ds.isel(time=slice(start_idx, start_idx + n_hours))

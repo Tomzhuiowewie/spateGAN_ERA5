@@ -1,7 +1,6 @@
-"""Neural network model definitions for spateGAN-ERA5.
+"""spateGAN-ERA5 的神经网络模型定义。
 
-Contains the Generator model and supporting modules for
-precipitation downscaling.
+包含用于降水降尺度的 Generator 模型及其辅助模块。
 """
 
 import torch
@@ -10,13 +9,13 @@ from torch.nn import functional as F
 
 
 class CustomDropout(nn.Module):
-    """Custom dropout that applies the same mask across the time dimension.
+    """在时间维度上使用相同掩码的自定义 dropout。
     
-    This ensures consistent dropout patterns for temporal data.
+    这可确保时间序列数据具有一致的 dropout 模式。
     
-    Args:
-        p: Dropout probability (0-1).
-        d_seed: Random seed for reproducibility.
+    参数：
+        p: Dropout 概率（0-1）。
+        d_seed: 用于可复现性的随机种子。
     """
     
     def __init__(self, p: float, d_seed: int) -> None:
@@ -25,13 +24,13 @@ class CustomDropout(nn.Module):
         torch.manual_seed(d_seed)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply dropout with time-consistent mask.
+        """应用时间一致的 dropout 掩码。
         
-        Args:
-            x: Input tensor of shape (batch, channels, time, height, width).
+        参数：
+            x: 形状为 (batch, channels, time, height, width) 的输入张量。
             
-        Returns:
-            Tensor with dropout applied.
+        返回：
+            应用 dropout 后的张量。
         """
         device = x.device
         batch, channels, time, height, width = x.shape
@@ -44,14 +43,14 @@ class CustomDropout(nn.Module):
 
 
 class ResidualBlock3D(nn.Module):
-    """3D Residual block with optional instance normalization.
+    """可选实例归一化的 3D 残差块。
     
-    Args:
-        in_channels: Number of input channels.
-        out_channels: Number of output channels.
-        use_layer_norm: Whether to use instance normalization.
-        stride: Convolution stride.
-        padding_type: If True, use reflection padding.
+    参数：
+        in_channels: 输入通道数。
+        out_channels: 输出通道数。
+        use_layer_norm: 是否使用实例归一化。
+        stride: 卷积步长。
+        padding_type: 为 True 时使用反射填充。
     """
     
     def __init__(
@@ -88,13 +87,13 @@ class ResidualBlock3D(nn.Module):
             self.adjust_conv = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the residual block.
+        """残差块的前向传播。
         
-        Args:
-            x: Input tensor of shape (batch, channels, time, height, width).
+        参数：
+            x: 形状为 (batch, channels, time, height, width) 的输入张量。
             
-        Returns:
-            Output tensor with residual connection applied.
+        返回：
+            应用残差连接后的输出张量。
         """
         residual = x
 
@@ -122,11 +121,11 @@ class ResidualBlock3D(nn.Module):
 
 
 class Interpolate(nn.Module):
-    """Trilinear interpolation module for upsampling.
+    """用于上采样的三线性插值模块。
     
-    Args:
-        scale_factor: Scaling factor for each dimension (time, height, width).
-        mode: Interpolation mode (default: 'trilinear').
+    参数：
+        scale_factor: 各维度（time, height, width）的缩放因子。
+        mode: 插值模式（默认：'trilinear'）。
     """
     
     def __init__(self, scale_factor: tuple[int, int, int], mode: str = 'trilinear') -> None:
@@ -135,21 +134,21 @@ class Interpolate(nn.Module):
         self.mode = mode
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Upsample the input tensor.
+        """对输入张量进行上采样。
         
-        Args:
-            x: Input tensor of shape (batch, channels, time, height, width).
+        参数：
+            x: 形状为 (batch, channels, time, height, width) 的输入张量。
             
-        Returns:
-            Upsampled tensor.
+        返回：
+            上采样后的张量。
         """
         return F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode, align_corners=False)
 
 
 class Constraint(nn.Module):
-    """Constraint layer to enforce ERA5 precipitation conservation.
+    """用于强制 ERA5 降水守恒的约束层。
     
-    Scales predictions to match ERA5 total precipitation sum.
+    缩放预测结果，使其匹配 ERA5 总降水量。
     """
     
     def __init__(self) -> None:
@@ -158,14 +157,14 @@ class Constraint(nn.Module):
     def forward(
         self, prediction: torch.Tensor, constraint: torch.Tensor
     ) -> torch.Tensor:
-        """Apply constraint to match ERA5 totals.
+        """应用约束以匹配 ERA5 总量。
         
-        Args:
-            prediction: Model prediction tensor.
-            constraint: ERA5 constraint tensor.
+        参数：
+            prediction: 模型预测张量。
+            constraint: ERA5 约束张量。
             
-        Returns:
-            Scaled prediction tensor.
+        返回：
+            缩放后的预测张量。
         """
         constraint = constraint[:, :, 5:-5, 8:-8, 8:-8].sum(dim=1, keepdim=True)
         scale = (constraint[:, 0].mean(dim=(1, 2, 3)) / 6).view(-1, 1, 1, 1, 1)
@@ -174,13 +173,12 @@ class Constraint(nn.Module):
 
 
 class Generator(nn.Module):
-    """spateGAN Generator for precipitation downscaling.
+    """用于降水降尺度的 spateGAN 生成器。
     
-    Transforms coarse ERA5 precipitation data into high-resolution
-    precipitation fields using a residual convolutional architecture.
+    使用残差卷积架构，将粗分辨率 ERA5 降水数据转换为高分辨率降水场。
     
-    Input shape: (batch, 2, 16, 28, 28) - 2 channels (CP, LSP), 16 hours, 28x28 grid
-    Output shape: (batch, 1, 48, 168, 168) - 8 hours at 10-min resolution, 168x168 grid
+    输入形状：(batch, 2, 16, 28, 28) - 2 个通道（CP, LSP）、16 小时、28x28 网格
+    输出形状：(batch, 1, 48, 168, 168) - 10 分钟分辨率的 8 小时数据、168x168 网格
     """
     def __init__(self):
         super().__init__()
@@ -189,7 +187,7 @@ class Generator(nn.Module):
         self._initialize_layers()
 
     def _initialize_layers(self):
-        """Initialize model layers."""
+        """初始化模型层。"""
         f = self.filter_size
 
         self.input_pad = nn.ReflectionPad3d((1, 1, 1, 1, 0, 0))
@@ -228,14 +226,14 @@ class Generator(nn.Module):
         self.constraint_layer = Constraint()
 
     def forward(self, x: torch.Tensor, dropout_seed: int) -> torch.Tensor:
-        """Generate high-resolution precipitation from ERA5 input.
+        """从 ERA5 输入生成高分辨率降水。
         
-        Args:
-            x: Input tensor of shape (batch, 2, 16, height, width).
-            dropout_seed: Random seed for dropout consistency.
+        参数：
+            x: 形状为 (batch, 2, 16, height, width) 的输入张量。
+            dropout_seed: 用于保持 dropout 一致性的随机种子。
             
-        Returns:
-            High-resolution precipitation tensor.
+        返回：
+            高分辨率降水张量。
         """
         x1 = self.res1(x)
         x1 = CustomDropout(p=0.2, d_seed=dropout_seed)(x1)

@@ -1,9 +1,6 @@
 """
-spateGAN-ERA5 spatiotemporal precipitation downscaling example
-https://www.nature.com/articles/s41612-025-01103-y
-
-This script runs inference on test example data and saves visualization plots.
-Run with: uv run downscale.py
+此脚本在测试样例数据上运行推理，并保存可视化图像。
+运行方式：uv run downscale.py
 """
 
 import torch
@@ -19,22 +16,22 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
 
-from src.spategan_era5.model import Generator
-from src.spategan_era5.inference import InferenceEngine
+from model import Generator
+from inference import InferenceEngine
 
 
 def main():
-    # Setup paths
+    # 设置路径
     project_root = pathlib.Path(__file__).parent
     model_path = project_root / "model_weights" / "model_weights.pt"
     fn_test_y = project_root / "data" / "y_test.nc"
     fn_test_x = project_root / "data" / "x_test.nc"
     
-    # Create output directory for plots
+    # 创建绘图输出目录
     plot_dir = project_root / "plots"
     plot_dir.mkdir(exist_ok=True)
     
-    # Verify required files exist
+    # 验证必需文件是否存在
     for file_path, file_name in [
         (model_path, "model weights"),
         (fn_test_x, "test input data"),
@@ -44,11 +41,11 @@ def main():
             print(f"ERROR: {file_name} not found at {file_path}", file=sys.stderr)
             return 1
 
-    # Setup device
+    # 设置计算设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Using device: {device}")
 
-    # Load model and weights
+    # 加载模型和权重
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loading model...")
     try:
         spateGAN_era5 = Generator().to(device)
@@ -60,7 +57,7 @@ def main():
         print(f"ERROR: Failed to load model: {e}", file=sys.stderr)
         return 1
 
-    # Load example dataset
+    # 加载样例数据集
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loading test datasets...")
     try:
         ds_test_y = xr.open_dataset(fn_test_y).load()
@@ -70,14 +67,14 @@ def main():
         print(f"ERROR: Failed to load datasets: {e}", file=sys.stderr)
         return 1
 
-    # Prepare data
+    # 准备数据
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Preparing data...")
     try:
         x_test = np.stack([ds_test_x.cp.values, ds_test_x.lsp.values])
         x_test = rearrange(x_test, "c t h w -> 1 c t h w")
         y_test = rearrange(ds_test_y.rainfall_amount.values, "t h w -> 1 1 t h w")
         
-        # Validate data shapes and ranges
+        # 验证数据形状和取值范围
         assert x_test.shape[1] == 2, f"Expected 2 input channels, got {x_test.shape[1]}"
         assert y_test.shape[1] == 1, f"Expected 1 target channel, got {y_test.shape[1]}"
         assert not np.isnan(x_test).any(), "Input data contains NaN values"
@@ -89,12 +86,12 @@ def main():
         print(f"ERROR: Failed to prepare data: {e}", file=sys.stderr)
         return 1
 
-    # Downscale data to 2x2km & 10 min resolution
-    # Patchsizes:
-    # x: (batch, channels, time, width, height) = (batch, 2, 16, 28, 28) = (batch, CP & LSP, 16hr, 672km, 672km)
-    # y: (batch, channels, time, width, height) = (batch, 1, 48, 168, 168) = (batch,TP, 8hr, 336km, 336km) --> cropped to (batch,TP, 6hr, 288km, 288km)
+    # 将数据降尺度到 2x2 km、10 分钟分辨率
+    # patch 大小：
+    # x: (batch, channels, time, width, height) = (batch, 2, 16, 28, 28) = (batch, CP & LSP, 16 小时, 672 km, 672 km)
+    # y: (batch, channels, time, width, height) = (batch, 1, 48, 168, 168) = (batch, TP, 8 小时, 336 km, 336 km) --> 裁剪为 (batch, TP, 6 小时, 288 km, 288 km)
 
-    # Initialize InferenceEngine
+    # 初始化 InferenceEngine
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Running inference...")
     try:
         engine = InferenceEngine(spateGAN_era5)
@@ -107,7 +104,7 @@ def main():
         print(f"ERROR: Inference failed: {e}", file=sys.stderr)
         return 1
 
-    # Plot results
+    # 绘制结果
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Generating visualization...")
     try:
         timestep = 100
@@ -117,7 +114,7 @@ def main():
         fig = plt.figure(figsize=(14, 7))
         gs = gridspec.GridSpec(3, 7, figure=fig, width_ratios=[1] * 6 + [0.05])
 
-        # Plot ERA5 TP data
+        # 绘制 ERA5 TP 数据
         ax = fig.add_subplot(gs[0, 0])
         img = ax.imshow(era5[timestep // 6], cmap="turbo", vmin=vmin, vmax=vmax)
         ax.set_title(f"ERA5 TP, t")
@@ -133,7 +130,7 @@ def main():
             ax = fig.add_subplot(gs[2, j])
             axes_pred.append(ax)
 
-        # Plot RADKLIM-YW data
+        # 绘制 RADKLIM-YW 数据
         for i, ax in enumerate(axes_tar):
             img = ax.imshow(target[timestep + i], cmap="turbo", vmin=vmin, vmax=vmax)
             if i == 0:
@@ -142,7 +139,7 @@ def main():
                 ax.set_title(f"t+{i*10}min.")
             ax.axis("off")
 
-        # Plot predictions
+        # 绘制预测结果
         for i, ax in enumerate(axes_pred):
             img = ax.imshow(prediction[timestep + i], cmap="turbo", vmin=vmin, vmax=vmax)
             if i == 0:
@@ -151,13 +148,13 @@ def main():
                 ax.set_title(f"t+{i*10}min.")
             ax.axis("off")
 
-        # Add the colorbar
+        # 添加色标
         colorbar_ax = fig.add_subplot(gs[-1, 6])
         fig.colorbar(img, cax=colorbar_ax, label="Rain [mm/h]")
 
         plt.tight_layout()
         
-        # Save plot instead of showing
+        # 保存图像而不是显示图像
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         plot_path = plot_dir / f"downscaling_result_{timestamp}.png"
         plt.savefig(plot_path, dpi=150, bbox_inches="tight")

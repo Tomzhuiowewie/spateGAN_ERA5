@@ -1,8 +1,7 @@
 """
-Pipeline for ERA5 downscaling.
+ERA5 降尺度流水线。
 
-This module provides the main workflow functions that wire together
-the dataloader, preprocessing, projection, and inference components.
+本模块提供主工作流函数，用于串联数据加载、预处理、投影和推理组件。
 """
 
 import logging
@@ -10,20 +9,20 @@ from pathlib import Path
 
 import xarray as xr
 
-from src.spategan_era5.dataloader import load_and_prepare_dataset
-from src.spategan_era5.downscaling_inference import ERA5DownscalingInference
-from src.spategan_era5.preprocessing import (
+from dataloader import load_and_prepare_dataset
+from downscaling_inference import ERA5DownscalingInference
+from preprocessing import (
     calculate_domain_center,
     slice_data_for_projection,
     validate_patch_extraction,
     validate_time_dimension,
 )
-from src.spategan_era5.projection import (
+from projection import (
     latlon_to_utm,
     prediction_output_dataset,
     utm_to_latlon,
 )
-from src.spategan_era5.utils import generate_output_filename
+from utils import generate_output_filename
 
 logger = logging.getLogger(__name__)
 
@@ -35,21 +34,21 @@ def load_era5_data(
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> tuple[xr.Dataset, str]:
-    """Load and prepare ERA5 dataset.
+    """加载并准备 ERA5 数据集。
     
-    Args:
-        input_path: Path to input NetCDF file.
-        precip_unit: Unit of precipitation in input data.
-        required_hours: Minimum required time steps in hours.
-        start_date: Optional start date for filtering.
-        end_date: Optional end date for filtering.
+    参数：
+        input_path: 输入 NetCDF 文件路径。
+        precip_unit: 输入数据中的降水单位。
+        required_hours: 最少所需时间步，单位为小时。
+        start_date: 可选的筛选起始日期。
+        end_date: 可选的筛选结束日期。
         
-    Returns:
-        Tuple of (prepared dataset, variable name).
+    返回：
+        (准备后的数据集, 变量名) 元组。
         
-    Raises:
-        FileNotFoundError: If input file doesn't exist.
-        ValueError: If data validation fails.
+    抛出：
+        FileNotFoundError: 输入文件不存在时抛出。
+        ValueError: 数据校验失败时抛出。
     """
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -84,22 +83,22 @@ def extract_patch(
     extra_padding_cells: int,
     required_hours: int,
 ) -> tuple[xr.Dataset, dict, tuple[float, float]]:
-    """Validate domain and extract patch for processing.
+    """校验区域并提取用于处理的 patch。
     
-    Args:
-        ds: ERA5 dataset in lat-lon projection.
-        center_lat: Center latitude of patch.
-        center_lon: Center longitude of patch.
-        patch_size_km: Size of patch in kilometers.
-        patch_padding_km: Padding around patch in kilometers.
-        extra_padding_cells: Extra cells for projection padding.
-        required_hours: Minimum required hours of data.
+    参数：
+        ds: 经纬度投影下的 ERA5 数据集。
+        center_lat: patch 中心纬度。
+        center_lon: patch 中心经度。
+        patch_size_km: patch 大小，单位为千米。
+        patch_padding_km: patch 周围填充，单位为千米。
+        extra_padding_cells: 投影填充的额外单元数。
+        required_hours: 最少所需数据小时数。
         
-    Returns:
-        Tuple of (sliced dataset, slicing info, (center_lat, center_lon)).
+    返回：
+        (切片数据集, 切片信息, (center_lat, center_lon)) 元组。
         
-    Raises:
-        ValueError: If patch extraction validation fails.
+    抛出：
+        ValueError: patch 提取校验失败时抛出。
     """
     logger.info("Validating patch extraction...")
     
@@ -136,15 +135,15 @@ def project_to_utm(
     center_lat: float,
     center_lon: float,
 ) -> tuple[xr.Dataset, xr.Dataset]:
-    """Project data to UTM coordinates at two resolutions.
+    """将数据投影到两种分辨率的 UTM 坐标。
     
-    Args:
-        ds: Dataset in lat-lon projection.
-        center_lat: Center latitude for UTM zone.
-        center_lon: Center longitude for UTM zone.
+    参数：
+        ds: 经纬度投影下的数据集。
+        center_lat: 用于确定 UTM 分区的中心纬度。
+        center_lon: 用于确定 UTM 分区的中心经度。
         
-    Returns:
-        Tuple of (high-res 336x336 dataset, low-res 28x28 dataset).
+    返回：
+        (高分辨率 336x336 数据集, 低分辨率 28x28 数据集) 元组。
     """
     ds_utm_336 = latlon_to_utm(
         ds, center_lat=center_lat, center_lon=center_lon,
@@ -164,15 +163,15 @@ def run_inference(
     ds_utm_336: xr.Dataset,
     config: dict,
 ) -> xr.Dataset:
-    """Run model inference on prepared data.
+    """在准备好的数据上运行模型推理。
     
-    Args:
-        ds_utm_28: Low-resolution UTM input dataset.
-        ds_utm_336: High-resolution UTM dataset for output template.
-        config: Configuration dictionary.
+    参数：
+        ds_utm_28: 低分辨率 UTM 输入数据集。
+        ds_utm_336: 用作输出模板的高分辨率 UTM 数据集。
+        config: 配置字典。
         
-    Returns:
-        Prediction dataset in UTM projection.
+    返回：
+        UTM 投影下的预测数据集
     """
     ds_utm_pred = prediction_output_dataset(ds_utm_336)
     
@@ -204,15 +203,15 @@ def save_outputs(
     config: dict,
     save_model_input: bool = False,
 ) -> None:
-    """Save prediction outputs to files.
+    """将预测输出保存到文件。
     
-    Args:
-        predictions_utm: Predictions in UTM projection.
-        ds_utm_28: Model input in UTM projection.
-        output_utm_dir: Directory for UTM outputs.
-        output_latlon_dir: Directory for lat-lon outputs.
-        config: Configuration dictionary.
-        save_model_input: Whether to save model input alongside predictions.
+    参数：
+        predictions_utm: UTM 投影下的预测结果。
+        ds_utm_28: UTM 投影下的模型输入。
+        output_utm_dir: UTM 输出目录。
+        output_latlon_dir: 经纬度输出目录。
+        config: 配置字典。
+        save_model_input: 是否随预测结果一起保存模型输入。
     """
     if output_latlon_dir:
         output_latlon_dir.mkdir(parents=True, exist_ok=True)
@@ -248,12 +247,12 @@ def _create_precipitation_sums_plot(
     project_root: Path,
     config: dict,
 ) -> None:
-    """Create a simple side-by-side precipitation sums plot.
+    """创建一个简单的降水总量并排对比图。
 
-    Left: (ds_utm_28.cp + ds_utm_28.lsp).sum(dim='time')
-    Right: predictions_utm.precipitation.sum(dim='time')
+    左图：(ds_utm_28.cp + ds_utm_28.lsp).sum(dim='time')
+    右图：predictions_utm.precipitation.sum(dim='time')
 
-    Saves PNG to `project_root / plots` (or config['data']['plots_path']).
+    将 PNG 保存到 `project_root / plots`（或 config['data']['plots_path']）。
     """
     plotting_cfg = config.get("plotting", {})
     if not plotting_cfg.get("precipitation_sums", False):
@@ -273,7 +272,7 @@ def _create_precipitation_sums_plot(
 
         right = None
         if "precipitation" in predictions_utm.data_vars:
-            right = (predictions_utm["precipitation"]/6).sum(dim="time") # /6 since 6 time steps per hour
+            right = (predictions_utm["precipitation"]/6).sum(dim="time") # 除以 6，因为每小时有 6 个时间步
         else:
             logger.warning("predictions_utm missing 'precipitation' variable; right plot will be empty")
 
@@ -314,10 +313,10 @@ def _create_precipitation_sums_plot(
 
 
 def fill_nans_if_sparse(ds: xr.Dataset, threshold=0.01) -> xr.Dataset:
-    # total number of values across all variables
+    # 所有变量中的总值数量
     total_values = sum(da.size for da in ds.data_vars.values())
 
-    # total number of NaNs across all variables
+    # 所有变量中的 NaN 总数
     nan_values = sum(
         int(da.isnull().sum().values)
         for da in ds.data_vars.values()
@@ -336,20 +335,20 @@ def fill_nans_if_sparse(ds: xr.Dataset, threshold=0.01) -> xr.Dataset:
 
 
 def run_downscaling_pipeline(config: dict, project_root: Path) -> None:
-    """Run the complete downscaling pipeline.
+    """运行完整的降尺度流水线。
     
-    This is the main orchestration function that wires together all
-    pipeline stages: load -> extract -> project -> infer -> save.
+    这是主编排函数，串联全部流水线阶段：
+    加载 -> 提取 -> 投影 -> 推理 -> 保存。
     
-    Args:
-        config: Configuration dictionary.
-        project_root: Project root directory.
+    参数：
+        config: 配置字典。
+        project_root: 项目根目录。
         
-    Raises:
-        FileNotFoundError: If input file doesn't exist.
-        ValueError: If validation fails.
+    抛出：
+        FileNotFoundError: 输入文件不存在时抛出。
+        ValueError: 校验失败时抛出。
     """
-    # Stage 1: Load data
+    # 阶段 1：加载数据
     input_path = project_root / config["data"]["input_path"]
     ds_era5, _ = load_era5_data(
         input_path=input_path,
@@ -359,7 +358,7 @@ def run_downscaling_pipeline(config: dict, project_root: Path) -> None:
         end_date=config["time"].get("end_date"),
     )
     
-    # Stage 2: Extract patch
+    # 阶段 2：提取 patch
     ds_sliced, _, center_coords = extract_patch(
         ds=ds_era5,
         center_lat=config["domain"]["center_lat"],
@@ -372,18 +371,18 @@ def run_downscaling_pipeline(config: dict, project_root: Path) -> None:
     
     logger.info("running UTM projection")
     
-    # Stage 3: Project to UTM
+    # 阶段 3：投影到 UTM
     ds_utm_336, ds_utm_28 = project_to_utm(ds_sliced, *center_coords)
     
-    # Stage 3.1: Fill NaNs if sparse
+    # 阶段 3.1：如果 NaN 很稀疏，则填充 NaN
     ds_utm_28 = fill_nans_if_sparse(ds_utm_28, threshold=config.get("data", {}).get("nan_fill_threshold", 0.01))
         
-    # Stage 4: Run inference
+    # 阶段 4：运行推理
     predictions_utm = run_inference(ds_utm_28, ds_utm_336, config)
     
-    # Stage 4: Plot precipitation maps (optional)
+    # 阶段 4：绘制降水图（可选）
     
-    # Stage 5: Save outputs
+    # 阶段 5：保存输出
     output_utm_dir = (
         project_root / config["data"]["output_utm_path"]
         if config["data"].get("output_utm_path") else None
@@ -402,11 +401,11 @@ def run_downscaling_pipeline(config: dict, project_root: Path) -> None:
         save_model_input=config["data"].get("save_model_input", False),
     )
 
-    # Optional simple plotting
+    # 可选的简单绘图
     try:
         _create_precipitation_sums_plot(predictions_utm, ds_utm_28, project_root, config)
     except Exception:
-        # _create_precipitation_sums_plot logs its own errors
+        # _create_precipitation_sums_plot 会自行记录错误
         pass
     
     logger.info("Downscaling pipeline completed successfully!")

@@ -1,64 +1,63 @@
-"""spateGAN-ERA5: Deep learning framework for ERA5 precipitation downscaling.
+"""spateGAN-ERA5：用于 ERA5 降水降尺度的深度学习框架。
 
-This package provides tools for spatio-temporal downscaling of ERA5
-precipitation data from 24 km/1-hour to 2 km/10-minute resolution using
-a probabilistic conditional GAN architecture.
+本包提供基于概率条件 GAN 架构的工具，用于将 ERA5 降水数据从
+24 km/1 小时分辨率时空降尺度到 2 km/10 分钟分辨率。
 
-Example usage:
+用法示例：
     >>> from spategan_era5 import Generator, ERA5DownscalingInference
     >>> from spategan_era5.dataloader import load_and_prepare_dataset
     >>> from spategan_era5.projection import latlon_to_utm, utm_to_latlon
     >>> from spategan_era5.pipeline import run_downscaling_pipeline
 """
 
-from src.spategan_era5.dataloader import (
+from dataloader import (
     detect_cp_lsp_vars,
     load_and_prepare_dataset,
     normalize_longitude,
 )
-from src.spategan_era5.downscaling_inference import ERA5DownscalingInference
-from src.spategan_era5.inference import InferenceEngine
-from src.spategan_era5.model import Generator
-from src.spategan_era5.pipeline import run_downscaling_pipeline
-from src.spategan_era5.preprocessing import (
+from downscaling_inference import ERA5DownscalingInference
+from inference import InferenceEngine
+from model import Generator
+from pipeline import run_downscaling_pipeline
+from preprocessing import (
     calculate_domain_center,
     slice_data_for_projection,
     validate_patch_extraction,
     validate_time_dimension,
 )
-from src.spategan_era5.projection import (
+from projection import (
     latlon_to_utm,
     prediction_output_dataset,
     utm_to_latlon,
 )
-from src.spategan_era5.utils import (
+from utils import (
     DataInterpolation,
     generate_output_filename,
     haversine,
 )
 
 __all__ = [
-    # Model
+    # 模型
     "Generator",
-    # Inference
+    # 推理
     "InferenceEngine",
     "ERA5DownscalingInference",
-    # Pipeline
+    # 流水线
     "run_downscaling_pipeline",
-    # Data loading
+    # 数据加载
     "load_and_prepare_dataset",
     "detect_cp_lsp_vars",
     "normalize_longitude",
-    # Preprocessing
+    # 预处理
     "validate_patch_extraction",
     "slice_data_for_projection",
     "calculate_domain_center",
     "validate_time_dimension",
-    # Projection
+    # 投影
     "latlon_to_utm",
     "utm_to_latlon",
     "prediction_output_dataset",
-    # Utilities
+    # 工具函数
     "haversine",
     "DataInterpolation",
     "generate_output_filename",
