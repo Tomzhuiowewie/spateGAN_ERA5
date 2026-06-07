@@ -9,20 +9,20 @@ from pathlib import Path
 
 import xarray as xr
 
-from dataloader import load_and_prepare_dataset
-from downscaling_inference import ERA5DownscalingInference
-from preprocessing import (
+from .dataloader import load_and_prepare_dataset
+from .downscaling_inference import ERA5DownscalingInference
+from .preprocessing import (
     calculate_domain_center,
     slice_data_for_projection,
     validate_patch_extraction,
     validate_time_dimension,
 )
-from projection import (
+from .projection import (
     latlon_to_utm,
     prediction_output_dataset,
     utm_to_latlon,
 )
-from utils import generate_output_filename
+from .utils import generate_output_filename
 
 logger = logging.getLogger(__name__)
 

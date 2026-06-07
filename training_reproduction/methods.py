@@ -12,7 +12,6 @@ import torch.nn.functional as F
 
 from losses import (
     discriminator_loss,
-    ensemble_l1_loss,
     generator_adversarial_loss,
 )
 from model import CNNDownscaler, Discriminator, Generator
@@ -23,9 +22,22 @@ class TrainingMethod:
 
     def __init__(self, device: torch.device) -> None:
         self.device = device
+        self.use_amp = device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+
+    def autocast(self):
+        return torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp)
 
     def train_step(self, x: torch.Tensor, y: torch.Tensor) -> dict[str, float]:
         """训练一个 batch，并返回需要打印的 loss。"""
+        raise NotImplementedError
+
+    def validation_step(
+        self, x: torch.Tensor, y: torch.Tensor, seed: int
+    ) -> tuple[dict[str, float], torch.Tensor]:
+        raise NotImplementedError
+
+    def visualization_prediction(self, x: torch.Tensor, seed: int) -> torch.Tensor:
         raise NotImplementedError
 
     def checkpoint_state(self) -> dict:
@@ -87,14 +99,17 @@ class AdversarialGANMethod(TrainingMethod):
         self.generator.train()
 
         self.d_optimizer.zero_grad(set_to_none=True)
-        with torch.no_grad():
-            fake = self.generator(x, self._next_dropout_seed())
+        with self.autocast():
+            with torch.no_grad():
+                fake = self.generator(x, self._next_dropout_seed())
 
-        real_logits = self.discriminator(x, y)
-        fake_logits = self.discriminator(x, fake.detach())
-        loss = discriminator_loss(real_logits, fake_logits)
-        loss.backward()
-        self.d_optimizer.step()
+            real_logits = self.discriminator(x, y)
+            fake_logits = self.discriminator(x, fake)
+            loss = discriminator_loss(real_logits, fake_logits)
+
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.d_optimizer)
+        self.scaler.update()
         return float(loss.detach().cpu())
 
     def _train_generator_step(self, x: torch.Tensor, y: torch.Tensor) -> tuple[float, float, float]:
@@ -104,21 +119,71 @@ class AdversarialGANMethod(TrainingMethod):
         self.generator.train()
 
         self.g_optimizer.zero_grad(set_to_none=True)
-        predictions = [
-            self.generator(x, self._next_dropout_seed())
-            for _ in range(self.ensemble_size)
+        seeds = [self._next_dropout_seed() for _ in range(self.ensemble_size)]
+
+        # The ensemble loss depends on the mean prediction. Compute its exact
+        # output gradient first, then recompute and backpropagate one member at
+        # a time so only one very large generator graph resides on the GPU.
+        with torch.no_grad(), self.autocast():
+            ensemble_sum = torch.zeros_like(y)
+            for seed in seeds:
+                ensemble_sum.add_(self.generator(x, seed))
+            ensemble_mean = ensemble_sum / self.ensemble_size
+            l1 = F.l1_loss(ensemble_mean, y)
+            l1_output_grad = (
+                torch.sign(ensemble_mean - y)
+                * (self.l1_weight / (self.ensemble_size * y.numel()))
+            )
+
+        discriminator_requires_grad = [
+            parameter.requires_grad for parameter in self.discriminator.parameters()
         ]
-        fake_logits = self.discriminator(x, predictions[0])
-        adv = generator_adversarial_loss(fake_logits)
-        l1 = ensemble_l1_loss(predictions, y)
-        loss = adv + self.l1_weight * l1
-        loss.backward()
-        self.g_optimizer.step()
+        for parameter in self.discriminator.parameters():
+            parameter.requires_grad_(False)
+
+        adv = torch.zeros((), device=self.device)
+        try:
+            for member_index, seed in enumerate(seeds):
+                with self.autocast():
+                    prediction = self.generator(x, seed)
+                    member_loss = (prediction * l1_output_grad).sum()
+                    if member_index == 0:
+                        fake_logits = self.discriminator(x, prediction)
+                        adv = generator_adversarial_loss(fake_logits)
+                        member_loss = member_loss + adv
+                self.scaler.scale(member_loss).backward()
+        finally:
+            for parameter, requires_grad in zip(
+                self.discriminator.parameters(), discriminator_requires_grad
+            ):
+                parameter.requires_grad_(requires_grad)
+
+        self.scaler.step(self.g_optimizer)
+        self.scaler.update()
+        loss = adv.detach() + self.l1_weight * l1
         return (
             float(loss.detach().cpu()),
             float(adv.detach().cpu()),
             float(l1.detach().cpu()),
         )
+
+    def validation_step(
+        self, x: torch.Tensor, y: torch.Tensor, seed: int
+    ) -> tuple[dict[str, float], torch.Tensor]:
+        self.generator.eval()
+        with torch.no_grad(), self.autocast():
+            ensemble_sum = torch.zeros_like(y)
+            for member_index in range(self.ensemble_size):
+                ensemble_sum.add_(self.generator(x, seed + member_index))
+            prediction = ensemble_sum / self.ensemble_size
+            mae = F.l1_loss(prediction, y)
+            mse = F.mse_loss(prediction, y)
+        return {"val_mae": float(mae.cpu()), "val_mse": float(mse.cpu())}, prediction
+
+    def visualization_prediction(self, x: torch.Tensor, seed: int) -> torch.Tensor:
+        self.generator.eval()
+        with torch.no_grad():
+            return self.generator(torch.clamp(x, min=0.0), seed)
 
     def checkpoint_state(self) -> dict:
         return {
@@ -152,12 +217,31 @@ class CNNMethod(TrainingMethod):
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
-        prediction = self.model(x)
-        loss = F.l1_loss(prediction, y)
+        with self.autocast():
+            prediction = self.model(x)
+            loss = F.l1_loss(prediction, y)
 
-        loss.backward()
-        self.optimizer.step()
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         return {"loss": float(loss.detach().cpu())}
+
+    def validation_step(
+        self, x: torch.Tensor, y: torch.Tensor, seed: int
+    ) -> tuple[dict[str, float], torch.Tensor]:
+        del seed
+        self.model.eval()
+        with torch.no_grad(), self.autocast():
+            prediction = self.model(x)
+            mae = F.l1_loss(prediction, y)
+            mse = F.mse_loss(prediction, y)
+        return {"val_mae": float(mae.cpu()), "val_mse": float(mse.cpu())}, prediction
+
+    def visualization_prediction(self, x: torch.Tensor, seed: int) -> torch.Tensor:
+        del seed
+        self.model.eval()
+        with torch.no_grad():
+            return self.model(torch.clamp(x, min=0.0))
 
     def checkpoint_state(self) -> dict:
         return {

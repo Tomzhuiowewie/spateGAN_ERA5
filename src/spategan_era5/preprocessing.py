@@ -8,7 +8,7 @@ import numpy as np
 import xarray as xr
 from typing import Tuple
 
-from utils import haversine
+from .utils import haversine
 
 
 def validate_patch_extraction(

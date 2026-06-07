@@ -256,9 +256,12 @@ class Generator(nn.Module):
 
         output = self.output_conv(x2)
 
-        output[:,:,6:-6,12:-12,12:-12] = self.constraint_layer(output[:,:,6:-6,12:-12,12:-12], x)
-        
-        return output
+        constrained_output = output.clone()
+        constrained_output[:, :, 6:-6, 12:-12, 12:-12] = self.constraint_layer(
+            output[:, :, 6:-6, 12:-12, 12:-12], x
+        )
+
+        return constrained_output
 
 
 class DiscriminatorResidualBlock3D(nn.Module):

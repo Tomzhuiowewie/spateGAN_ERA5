@@ -10,27 +10,27 @@
     >>> from spategan_era5.pipeline import run_downscaling_pipeline
 """
 
-from dataloader import (
+from .dataloader import (
     detect_cp_lsp_vars,
     load_and_prepare_dataset,
     normalize_longitude,
 )
-from downscaling_inference import ERA5DownscalingInference
-from inference import InferenceEngine
-from model import Generator
-from pipeline import run_downscaling_pipeline
-from preprocessing import (
+from .downscaling_inference import ERA5DownscalingInference
+from .inference import InferenceEngine
+from .model import Generator
+from .pipeline import run_downscaling_pipeline
+from .preprocessing import (
     calculate_domain_center,
     slice_data_for_projection,
     validate_patch_extraction,
     validate_time_dimension,
 )
-from projection import (
+from .projection import (
     latlon_to_utm,
     prediction_output_dataset,
     utm_to_latlon,
 )
-from utils import (
+from .utils import (
     DataInterpolation,
     generate_output_filename,
     haversine,

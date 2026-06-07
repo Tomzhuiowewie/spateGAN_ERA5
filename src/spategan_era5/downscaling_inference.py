@@ -11,7 +11,7 @@ import torch
 import xarray as xr
 from tqdm import tqdm
 
-from model import Generator
+from .model import Generator
 
 
 class ERA5DownscalingInference:

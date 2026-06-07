@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 import random
 
@@ -102,12 +103,13 @@ class PairedPatchDataset(Dataset):
         y_target_shape: tuple[int, int, int] = (48, 168, 168),
         augment_every_other: bool = True,
         load_into_memory: bool = False,
+        dataset_cache_size: int = 16,
         seed: int = 42,
     ) -> None:
         import xarray as xr
 
-        self.x_files = _as_file_list(x_path, x_pattern)[:2]
-        self.y_files = _as_file_list(y_path, y_pattern)[:2]
+        self.x_files = _as_file_list(x_path, x_pattern)
+        self.y_files = _as_file_list(y_path, y_pattern)
         if len(self.x_files) != len(self.y_files):
             raise ValueError(
                 "x_path 和 y_path 必须包含相同数量的匹配文件: "
@@ -119,37 +121,68 @@ class PairedPatchDataset(Dataset):
         self.y_variable = y_variable
         self.y_target_shape = y_target_shape
         self.augment_every_other = augment_every_other
+        self.load_into_memory = load_into_memory
+        self.dataset_cache_size = max(0, dataset_cache_size)
+        self._dataset_cache: OrderedDict[int, tuple[object, object]] = OrderedDict()
         self.rng = random.Random(seed)
 
-        self.x_datasets = [xr.open_dataset(path) for path in self.x_files]
-        self.y_datasets = [xr.open_dataset(path) for path in self.y_files]
         if load_into_memory:
-            self.x_datasets = [ds.load() for ds in self.x_datasets]
-            self.y_datasets = [ds.load() for ds in self.y_datasets]
+            self.x_datasets = [xr.open_dataset(path).load() for path in self.x_files]
+            self.y_datasets = [xr.open_dataset(path).load() for path in self.y_files]
+        else:
+            self.x_datasets = None
+            self.y_datasets = None
 
         self.index: list[tuple[int, int | None]] = []
-        for file_idx, x_ds in enumerate(self.x_datasets):
-            y_ds = self.y_datasets[file_idx]
-            x_sample_dim = _sample_dim(x_ds)
-            y_sample_dim = _sample_dim(y_ds)
-
-            if (x_sample_dim is None) != (y_sample_dim is None):
-                raise ValueError(
-                    f"Sample dimension mismatch in pair {file_idx}: "
-                    f"x={x_sample_dim}, y={y_sample_dim}"
+        for file_idx in range(len(self.x_files)):
+            if load_into_memory:
+                self._index_file_pair(
+                    file_idx,
+                    self.x_datasets[file_idx],
+                    self.y_datasets[file_idx],
                 )
-
-            if x_sample_dim is None:
-                self.index.append((file_idx, None))
             else:
-                n_x = x_ds.sizes[x_sample_dim]
-                n_y = y_ds.sizes[y_sample_dim]
-                if n_x != n_y:
-                    raise ValueError(f"Sample count mismatch in pair {file_idx}: x={n_x}, y={n_y}")
-                self.index.extend((file_idx, sample_idx) for sample_idx in range(n_x))
+                with xr.open_dataset(self.x_files[file_idx]) as x_ds, xr.open_dataset(
+                    self.y_files[file_idx]
+                ) as y_ds:
+                    self._index_file_pair(file_idx, x_ds, y_ds)
+
+    def _index_file_pair(self, file_idx: int, x_ds, y_ds) -> None:
+        x_sample_dim = _sample_dim(x_ds)
+        y_sample_dim = _sample_dim(y_ds)
+
+        if (x_sample_dim is None) != (y_sample_dim is None):
+            raise ValueError(
+                f"Sample dimension mismatch in pair {file_idx}: "
+                f"x={x_sample_dim}, y={y_sample_dim}"
+            )
+
+        if x_sample_dim is None:
+            self.index.append((file_idx, None))
+            return
+
+        n_x = x_ds.sizes[x_sample_dim]
+        n_y = y_ds.sizes[y_sample_dim]
+        if n_x != n_y:
+            raise ValueError(f"Sample count mismatch in pair {file_idx}: x={n_x}, y={n_y}")
+        self.index.extend((file_idx, sample_idx) for sample_idx in range(n_x))
 
     def __len__(self) -> int:
         return len(self.index)
+
+    def close(self) -> None:
+        dataset_cache = getattr(self, "_dataset_cache", {})
+        for pair in dataset_cache.values():
+            for ds in pair:
+                ds.close()
+        dataset_cache.clear()
+
+        if getattr(self, "load_into_memory", False):
+            for ds in self.x_datasets + self.y_datasets:
+                ds.close()
+
+    def __del__(self) -> None:
+        self.close()
 
     def _select_sample(self, ds, sample_idx: int | None):
         sample_dim = _sample_dim(ds)
@@ -159,11 +192,31 @@ class PairedPatchDataset(Dataset):
             raise ValueError("sample_idx is required for sampled datasets")
         return ds.isel({sample_dim: sample_idx})
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        file_idx, sample_idx = self.index[idx]
-        x_ds = self._select_sample(self.x_datasets[file_idx], sample_idx)
-        y_ds = self._select_sample(self.y_datasets[file_idx], sample_idx)
+    def _get_dataset_pair(self, file_idx: int):
+        import xarray as xr
 
+        if file_idx in self._dataset_cache:
+            pair = self._dataset_cache.pop(file_idx)
+            self._dataset_cache[file_idx] = pair
+            return pair
+
+        pair = (
+            xr.open_dataset(self.x_files[file_idx]),
+            xr.open_dataset(self.y_files[file_idx]),
+        )
+        if self.dataset_cache_size == 0:
+            return pair
+
+        self._dataset_cache[file_idx] = pair
+        while len(self._dataset_cache) > self.dataset_cache_size:
+            _, evicted_pair = self._dataset_cache.popitem(last=False)
+            for ds in evicted_pair:
+                ds.close()
+        return pair
+
+    def _load_sample(self, x_ds, y_ds, sample_idx: int | None) -> tuple[torch.Tensor, torch.Tensor]:
+        x_ds = self._select_sample(x_ds, sample_idx)
+        y_ds = self._select_sample(y_ds, sample_idx)
         x_arrays = []
         for name in self.x_variables:
             if name not in x_ds:
@@ -186,6 +239,25 @@ class PairedPatchDataset(Dataset):
             y = _center_crop_tensor(y[0], self.y_target_shape).unsqueeze(0)
         else:
             raise ValueError(f"Expected y shape (T, H, W) or (1, T, H, W), got {tuple(y.shape)}")
+
+        return x, y
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        file_idx, sample_idx = self.index[idx]
+        if self.load_into_memory:
+            x, y = self._load_sample(
+                self.x_datasets[file_idx],
+                self.y_datasets[file_idx],
+                sample_idx,
+            )
+        else:
+            x_ds, y_ds = self._get_dataset_pair(file_idx)
+            try:
+                x, y = self._load_sample(x_ds, y_ds, sample_idx)
+            finally:
+                if self.dataset_cache_size == 0:
+                    x_ds.close()
+                    y_ds.close()
 
         if x.shape != (2, 16, 28, 28):
             raise ValueError(f"Expected x shape (2, 16, 28, 28), got {tuple(x.shape)}")
