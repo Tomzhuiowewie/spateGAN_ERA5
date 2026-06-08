@@ -53,9 +53,20 @@ plots/*.png
 !data/x_test.nc
 !data/y_test.nc
 
-data
+data/
 # Model weights (track the default weights)
 !model_weights/model_weights.pt
+
+# Training outputs
+training_reproduction/checkpoints/
+training_reproduction/notebook_parity_test/
+*.ckpt
+*.pth
+
+# Generated media
+*.png
+*.gif
+*.mp4
 
 # Logs
 *.log
