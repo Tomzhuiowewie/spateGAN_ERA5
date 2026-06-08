@@ -12,21 +12,22 @@ training_method: "gan"
 
 output_dir: "training_reproduction/checkpoints"
 
+# 多卡训练时这是每张 GPU 的 batch size。
+# 三张卡运行时，总 batch size = 2 * 3 = 6。
 batch_size: 2
 max_steps: 200000
-checkpoint_interval: 250
+checkpoint_interval: 1000
 
-# Full validation runs roughly once per training epoch.
 validation_x_path: "data/validation_data"
 validation_y_path: "data/validation_data"
 validation_x_pattern: "x_val*.nc"
 validation_y_pattern: "y_val*.nc"
-# null means calculate automatically from len(train_loader).
-validation_interval: null
+# 多卡训练时不要太频繁验证，否则验证和画图会抵消加速。
+validation_interval: 5000
 validation_interval_epochs: 1
 validation_batch_size: 2
 validation_max_batches: null
-save_visualizations: true
+save_visualizations: false
 visualization_vmin: 0.01
 visualization_vmax: 20.0
 # Notebook-compatible plot: fixed validation patch, hour and dropout seed.
@@ -36,7 +37,7 @@ visualization_seed: 4
 
 device: "cuda"
 seed: 42
-num_workers: 0
+num_workers: 4
 load_into_memory: false
 dataset_cache_size: 16
 

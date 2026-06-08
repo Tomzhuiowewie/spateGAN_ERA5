@@ -5,11 +5,14 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from itertools import islice
+import os
 from pathlib import Path
 import random
 
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from dataset import PairedPatchDataset
@@ -60,10 +63,28 @@ class Trainer:
 
     def __init__(self, config: TrainingConfig) -> None:
         self.config = config
-        self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.distributed = self.world_size > 1
+        self.is_main_process = self.rank == 0
 
-        torch.manual_seed(config.seed)
-        random.seed(config.seed)
+        if self.distributed and not dist.is_initialized():
+            backend = "nccl" if config.device == "cuda" and torch.cuda.is_available() else "gloo"
+            dist.init_process_group(backend=backend)
+
+        if config.device == "cuda" and torch.cuda.is_available():
+            if self.distributed:
+                torch.cuda.set_device(self.local_rank)
+                self.device = torch.device("cuda", self.local_rank)
+            else:
+                self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+        self.config.distributed = self.distributed
+
+        torch.manual_seed(config.seed + self.rank)
+        random.seed(config.seed + self.rank)
 
         self.dataset = PairedPatchDataset(
             config.x_path,
@@ -77,10 +98,23 @@ class Trainer:
             dataset_cache_size=config.dataset_cache_size,
             seed=config.seed,
         )
+        self.train_sampler = (
+            DistributedSampler(
+                self.dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True,
+                seed=config.seed,
+                drop_last=True,
+            )
+            if self.distributed
+            else None
+        )
         self.loader = DataLoader(
             self.dataset,
             batch_size=config.batch_size,
-            shuffle=True,
+            shuffle=self.train_sampler is None,
+            sampler=self.train_sampler,
             num_workers=config.num_workers,
             drop_last=True,
         )
@@ -108,9 +142,13 @@ class Trainer:
 
         self.method = build_training_method(config.training_method, self.device, config)
         self.output_dir = Path(config.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.is_main_process:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._distributed_barrier()
         self.visualization_dir = self.output_dir / "visualizations"
-        self.visualization_dir.mkdir(parents=True, exist_ok=True)
+        if self.is_main_process:
+            self.visualization_dir.mkdir(parents=True, exist_ok=True)
+        self._distributed_barrier()
         self.train_metrics_path = self.output_dir / "train_metrics.csv"
         self.validation_metrics_path = self.output_dir / "validation_metrics.csv"
         self.best_val_mae = float("inf")
@@ -118,22 +156,31 @@ class Trainer:
             self.validation_interval = config.validation_interval
         else:
             self.validation_interval = len(self.loader) * config.validation_interval_epochs
-        print(
-            f"train_samples={len(self.dataset)} steps_per_epoch={len(self.loader)} "
-            f"validation_interval={self.validation_interval}",
-            flush=True,
-        )
+        if self.is_main_process:
+            print(
+                f"train_samples={len(self.dataset)} steps_per_epoch={len(self.loader)} "
+                f"world_size={self.world_size} validation_interval={self.validation_interval}",
+                flush=True,
+            )
+
+    def _distributed_barrier(self) -> None:
+        if self.distributed and dist.is_initialized():
+            dist.barrier()
 
     def train(self) -> None:
         step = 0
+        epoch_index = 0
         progress = tqdm(
             total=self.config.max_steps,
             desc="training",
             unit="step",
             dynamic_ncols=True,
+            disable=not self.is_main_process,
         )
         try:
             while step < self.config.max_steps:
+                if self.train_sampler is not None:
+                    self.train_sampler.set_epoch(epoch_index)
                 for epoch_step, (x, y) in enumerate(self.loader, start=1):
                     step += 1
                     x = x.to(self.device, non_blocking=True)
@@ -141,17 +188,18 @@ class Trainer:
 
                     logs = self.method.train_step(x, y)
                     epoch = (step - 1) // len(self.loader) + 1
-                    self._append_metrics(
-                        self.train_metrics_path,
-                        {"step": step, "epoch": epoch, **logs},
-                    )
-                    progress.set_postfix(
-                        epoch=f"{epoch}:{epoch_step}/{len(self.loader)}",
-                        **{key: f"{value:.4f}" for key, value in logs.items()},
-                    )
-                    progress.update(1)
+                    if self.is_main_process:
+                        self._append_metrics(
+                            self.train_metrics_path,
+                            {"step": step, "epoch": epoch, **logs},
+                        )
+                        progress.set_postfix(
+                            epoch=f"{epoch}:{epoch_step}/{len(self.loader)}",
+                            **{key: f"{value:.4f}" for key, value in logs.items()},
+                        )
+                        progress.update(1)
 
-                    if step % self.config.checkpoint_interval == 0:
+                    if self.is_main_process and step % self.config.checkpoint_interval == 0:
                         self.save_checkpoint(step)
 
                     if (
@@ -161,17 +209,23 @@ class Trainer:
                             or step == self.config.max_steps
                         )
                     ):
-                        metrics = self.validate(step)
-                        progress.set_postfix(
-                            epoch=f"{epoch}:{epoch_step}/{len(self.loader)}",
-                            **{key: f"{value:.4f}" for key, value in logs.items()},
-                            **{key: f"{value:.4f}" for key, value in metrics.items()},
-                        )
+                        self._distributed_barrier()
+                        if self.is_main_process:
+                            metrics = self.validate(step)
+                            progress.set_postfix(
+                                epoch=f"{epoch}:{epoch_step}/{len(self.loader)}",
+                                **{key: f"{value:.4f}" for key, value in logs.items()},
+                                **{key: f"{value:.4f}" for key, value in metrics.items()},
+                            )
+                        self._distributed_barrier()
 
                     if step >= self.config.max_steps:
                         break
+                epoch_index += 1
         finally:
             progress.close()
+            if self.distributed and dist.is_initialized():
+                dist.destroy_process_group()
 
     def validate(self, step: int) -> dict[str, float]:
         totals: dict[str, float] = {}

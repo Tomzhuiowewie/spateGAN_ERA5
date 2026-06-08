@@ -8,6 +8,7 @@ from __future__ import annotations
 import random
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 import torch.nn.functional as F
 
 from losses import (
@@ -49,6 +50,24 @@ class TrainingMethod:
         raise NotImplementedError
 
 
+def _wrap_ddp(model: torch.nn.Module, device: torch.device, use_ddp: bool) -> torch.nn.Module:
+    """需要多卡训练时，把模型交给 PyTorch DDP 管理。"""
+
+    if not use_ddp:
+        return model
+    if device.type == "cuda":
+        return DistributedDataParallel(model, device_ids=[device.index])
+    return DistributedDataParallel(model)
+
+
+def _raw_model(model: torch.nn.Module) -> torch.nn.Module:
+    """保存权重时取出 DDP 里面真正的模型。"""
+
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
+
+
 class AdversarialGANMethod(TrainingMethod):
     """论文里的 cGAN 训练方式。"""
 
@@ -59,10 +78,13 @@ class AdversarialGANMethod(TrainingMethod):
         discriminator_lr: float = 2e-4,
         l1_weight: float = 1.0,
         ensemble_size: int = 3,
+        use_ddp: bool = False,
     ) -> None:
         super().__init__(device)
         self.generator = Generator().to(device)
         self.discriminator = Discriminator().to(device)
+        self.generator = _wrap_ddp(self.generator, device, use_ddp)
+        self.discriminator = _wrap_ddp(self.discriminator, device, use_ddp)
         self.l1_weight = l1_weight
         self.ensemble_size = ensemble_size
 
@@ -170,31 +192,33 @@ class AdversarialGANMethod(TrainingMethod):
     def validation_step(
         self, x: torch.Tensor, y: torch.Tensor, seed: int
     ) -> tuple[dict[str, float], torch.Tensor]:
-        self.generator.eval()
+        generator = _raw_model(self.generator)
+        generator.eval()
         with torch.no_grad(), self.autocast():
             ensemble_sum = torch.zeros_like(y)
             for member_index in range(self.ensemble_size):
-                ensemble_sum.add_(self.generator(x, seed + member_index))
+                ensemble_sum.add_(generator(x, seed + member_index))
             prediction = ensemble_sum / self.ensemble_size
             mae = F.l1_loss(prediction, y)
             mse = F.mse_loss(prediction, y)
         return {"val_mae": float(mae.cpu()), "val_mse": float(mse.cpu())}, prediction
 
     def visualization_prediction(self, x: torch.Tensor, seed: int) -> torch.Tensor:
-        self.generator.eval()
+        generator = _raw_model(self.generator)
+        generator.eval()
         with torch.no_grad():
-            return self.generator(torch.clamp(x, min=0.0), seed)
+            return generator(torch.clamp(x, min=0.0), seed)
 
     def checkpoint_state(self) -> dict:
         return {
-            "generator": self.generator.state_dict(),
-            "discriminator": self.discriminator.state_dict(),
+            "generator": _raw_model(self.generator).state_dict(),
+            "discriminator": _raw_model(self.discriminator).state_dict(),
             "generator_optimizer": self.g_optimizer.state_dict(),
             "discriminator_optimizer": self.d_optimizer.state_dict(),
         }
 
     def inference_state(self) -> dict[str, torch.Tensor]:
-        return self.generator.state_dict()
+        return _raw_model(self.generator).state_dict()
 
 
 class CNNMethod(TrainingMethod):
@@ -204,9 +228,11 @@ class CNNMethod(TrainingMethod):
         self,
         device: torch.device,
         lr: float = 1e-4,
+        use_ddp: bool = False,
     ) -> None:
         super().__init__(device)
         self.model = CNNDownscaler().to(device)
+        self.model = _wrap_ddp(self.model, device, use_ddp)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=lr,
@@ -230,27 +256,29 @@ class CNNMethod(TrainingMethod):
         self, x: torch.Tensor, y: torch.Tensor, seed: int
     ) -> tuple[dict[str, float], torch.Tensor]:
         del seed
-        self.model.eval()
+        model = _raw_model(self.model)
+        model.eval()
         with torch.no_grad(), self.autocast():
-            prediction = self.model(x)
+            prediction = model(x)
             mae = F.l1_loss(prediction, y)
             mse = F.mse_loss(prediction, y)
         return {"val_mae": float(mae.cpu()), "val_mse": float(mse.cpu())}, prediction
 
     def visualization_prediction(self, x: torch.Tensor, seed: int) -> torch.Tensor:
         del seed
-        self.model.eval()
+        model = _raw_model(self.model)
+        model.eval()
         with torch.no_grad():
-            return self.model(torch.clamp(x, min=0.0))
+            return model(torch.clamp(x, min=0.0))
 
     def checkpoint_state(self) -> dict:
         return {
-            "model": self.model.state_dict(),
+            "model": _raw_model(self.model).state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
 
     def inference_state(self) -> dict[str, torch.Tensor]:
-        return self.model.state_dict()
+        return _raw_model(self.model).state_dict()
 
 
 def build_training_method(method_name: str, device: torch.device, config) -> TrainingMethod:
@@ -263,10 +291,12 @@ def build_training_method(method_name: str, device: torch.device, config) -> Tra
             discriminator_lr=config.discriminator_lr,
             l1_weight=config.l1_weight,
             ensemble_size=config.ensemble_size,
+            use_ddp=getattr(config, "distributed", False),
         )
     if method_name == "cnn":
         return CNNMethod(
             device=device,
             lr=config.generator_lr,
+            use_ddp=getattr(config, "distributed", False),
         )
     raise ValueError(f"未知 training_method: {method_name}")
