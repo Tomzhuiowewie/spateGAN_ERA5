@@ -1,0 +1,51 @@
+# CPU smoke test config for PG-ERD.
+# This keeps the public tensor shapes unchanged but shrinks model/training volume.
+
+x_path: "data/training_data"
+y_path: "data/training_data"
+x_pattern: "x_train*.nc"
+y_pattern: "y_train*.nc"
+y_variable: "sample_high_res"
+x_target_shape: [16, 28, 28]
+y_target_shape: [48, 168, 168]
+
+training_method: "pg_erd"
+output_dir: "/tmp/spategan_pg_erd_cpu_smoke"
+
+batch_size: 1
+max_steps: 2
+checkpoint_interval: 999
+
+validation_x_path: "data/validation_data"
+validation_y_path: "data/validation_data"
+validation_x_pattern: "x_val*.nc"
+validation_y_pattern: "y_val*.nc"
+validation_interval: 1
+validation_batch_size: 1
+validation_max_batches: 1
+save_visualizations: false
+
+device: "cpu"
+seed: 42
+num_workers: 0
+load_into_memory: false
+dataset_cache_size: 1
+train_fraction: 0.01
+subset_seed: 42
+
+generator_lr: 0.0001
+discriminator_lr: 0.0002
+l1_weight: 1.0
+ensemble_size: 1
+
+base_channels: 4
+diffusion_steps: 20
+sampling_steps: 2
+base_weight: 1.0
+uncertainty_weight: 0.1
+diffusion_weight: 1.0
+recon_weight: 0.1
+mass_weight: 0.05
+pde_weight: 0.01
+smooth_weight: 0.005
+wet_threshold: 0.1

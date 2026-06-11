@@ -12,10 +12,17 @@ from torch.nn.parallel import DistributedDataParallel
 import torch.nn.functional as F
 
 from losses import (
+    base_reconstruction_loss,
+    diffusion_noise_loss,
     discriminator_loss,
     generator_adversarial_loss,
+    mass_conservation_loss,
+    pde_residual_loss,
+    smoothness_loss,
+    uncertainty_loss,
+    weighted_wet_l1_loss,
 )
-from model import CNNDownscaler, Discriminator, Generator
+from model import CNNDownscaler, Discriminator, Generator, PGBaseNet, PGERDDownscaler
 
 
 class TrainingMethod:
@@ -66,6 +73,82 @@ def _raw_model(model: torch.nn.Module) -> torch.nn.Module:
     if isinstance(model, DistributedDataParallel):
         return model.module
     return model
+
+
+def _common_regression_metrics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    wet_threshold: float = 0.1,
+) -> dict[str, float]:
+    mae = F.l1_loss(prediction, target)
+    mse = F.mse_loss(prediction, target)
+    rmse = torch.sqrt(mse)
+    bias = (prediction - target).mean()
+    wet_mask = target > wet_threshold
+    wet_mae = (prediction[wet_mask] - target[wet_mask]).abs().mean() if wet_mask.any() else mae
+    return {
+        "val_mae": float(mae.cpu()),
+        "val_mse": float(mse.cpu()),
+        "val_rmse": float(rmse.cpu()),
+        "val_bias": float(bias.cpu()),
+        "val_wet_mae": float(wet_mae.cpu()),
+    }
+
+
+class ERA5InterpolationMethod(TrainingMethod):
+    """无训练 ERA5 插值基线。"""
+
+    def __init__(
+        self,
+        device: torch.device,
+        mode: str = "trilinear",
+        wet_threshold: float = 0.1,
+    ) -> None:
+        super().__init__(device)
+        if mode not in {"trilinear", "nearest"}:
+            raise ValueError(f"Unsupported interpolation mode: {mode}")
+        self.mode = mode
+        self.wet_threshold = wet_threshold
+
+    def _predict(self, x: torch.Tensor, target_shape: tuple[int, int, int]) -> torch.Tensor:
+        coarse_total = x.sum(dim=1, keepdim=True).clamp_min(0.0)
+        if self.mode == "nearest":
+            return F.interpolate(coarse_total, size=target_shape, mode="nearest")
+        return F.interpolate(
+            coarse_total,
+            size=target_shape,
+            mode="trilinear",
+            align_corners=False,
+        )
+
+    def train_step(self, x: torch.Tensor, y: torch.Tensor) -> dict[str, float]:
+        with torch.no_grad():
+            prediction = self._predict(x, y.shape[2:])
+            loss = F.l1_loss(prediction, y)
+        return {"loss": float(loss.cpu())}
+
+    def validation_step(
+        self, x: torch.Tensor, y: torch.Tensor, seed: int
+    ) -> tuple[dict[str, float], torch.Tensor]:
+        del seed
+        with torch.no_grad():
+            prediction = self._predict(x, y.shape[2:])
+            metrics = _common_regression_metrics(
+                prediction,
+                y,
+                wet_threshold=self.wet_threshold,
+            )
+        return metrics, prediction
+
+    def visualization_prediction(self, x: torch.Tensor, seed: int) -> torch.Tensor:
+        del seed
+        return self._predict(torch.clamp(x, min=0.0), (48, 168, 168))
+
+    def checkpoint_state(self) -> dict:
+        return {"interpolation_mode": self.mode}
+
+    def inference_state(self) -> dict[str, torch.Tensor]:
+        return {}
 
 
 class AdversarialGANMethod(TrainingMethod):
@@ -260,9 +343,8 @@ class CNNMethod(TrainingMethod):
         model.eval()
         with torch.no_grad(), self.autocast():
             prediction = model(x)
-            mae = F.l1_loss(prediction, y)
-            mse = F.mse_loss(prediction, y)
-        return {"val_mae": float(mae.cpu()), "val_mse": float(mse.cpu())}, prediction
+            metrics = _common_regression_metrics(prediction, y)
+        return metrics, prediction
 
     def visualization_prediction(self, x: torch.Tensor, seed: int) -> torch.Tensor:
         del seed
@@ -281,9 +363,319 @@ class CNNMethod(TrainingMethod):
         return _raw_model(self.model).state_dict()
 
 
+class STResUNetMethod(TrainingMethod):
+    """只训练 PG-ERD 的确定性基础网络，用作强监督基线。"""
+
+    def __init__(
+        self,
+        device: torch.device,
+        lr: float = 1e-4,
+        base_channels: int = 32,
+        wet_threshold: float = 0.1,
+        use_ddp: bool = False,
+    ) -> None:
+        super().__init__(device)
+        self.model = PGBaseNet(base_channels=base_channels).to(device)
+        self.model = _wrap_ddp(self.model, device, use_ddp)
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=lr,
+            betas=(0.0, 0.999),
+        )
+        self.wet_threshold = wet_threshold
+
+    def train_step(self, x: torch.Tensor, y: torch.Tensor) -> dict[str, float]:
+        self.model.train()
+        self.optimizer.zero_grad(set_to_none=True)
+        with self.autocast():
+            outputs = self.model(x)
+            prediction = outputs["y_base"]
+            base_loss = base_reconstruction_loss(prediction, y)
+            recon_loss = weighted_wet_l1_loss(
+                prediction,
+                y,
+                wet_threshold=self.wet_threshold,
+            )
+            mass_loss = mass_conservation_loss(prediction, x)
+            loss = base_loss + 0.1 * recon_loss + 0.05 * mass_loss
+
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        return {
+            "loss": float(loss.detach().cpu()),
+            "base": float(base_loss.detach().cpu()),
+            "recon": float(recon_loss.detach().cpu()),
+            "mass": float(mass_loss.detach().cpu()),
+        }
+
+    def validation_step(
+        self, x: torch.Tensor, y: torch.Tensor, seed: int
+    ) -> tuple[dict[str, float], torch.Tensor]:
+        del seed
+        model = _raw_model(self.model)
+        model.eval()
+        with torch.no_grad(), self.autocast():
+            prediction = model(x)["y_base"]
+            metrics = _common_regression_metrics(
+                prediction,
+                y,
+                wet_threshold=self.wet_threshold,
+            )
+        return metrics, prediction
+
+    def visualization_prediction(self, x: torch.Tensor, seed: int) -> torch.Tensor:
+        del seed
+        model = _raw_model(self.model)
+        model.eval()
+        with torch.no_grad():
+            return model(torch.clamp(x, min=0.0))["y_base"]
+
+    def checkpoint_state(self) -> dict:
+        return {
+            "model": _raw_model(self.model).state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+        }
+
+    def inference_state(self) -> dict[str, torch.Tensor]:
+        return _raw_model(self.model).state_dict()
+
+
+class PGERDMethod(TrainingMethod):
+    """物理引导误差残差扩散训练方式。"""
+
+    def __init__(
+        self,
+        device: torch.device,
+        lr: float = 1e-4,
+        base_channels: int = 32,
+        diffusion_steps: int = 1000,
+        sampling_steps: int = 5,
+        ensemble_size: int = 3,
+        base_weight: float = 1.0,
+        uncertainty_weight: float = 0.1,
+        diffusion_weight: float = 1.0,
+        recon_weight: float = 0.1,
+        mass_weight: float = 0.05,
+        pde_weight: float = 0.01,
+        smooth_weight: float = 0.005,
+        wet_threshold: float = 0.1,
+        use_ddp: bool = False,
+    ) -> None:
+        super().__init__(device)
+        self.model = PGERDDownscaler(
+            base_channels=base_channels,
+            diffusion_steps=diffusion_steps,
+        ).to(device)
+        self.model = _wrap_ddp(self.model, device, use_ddp)
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=lr,
+            betas=(0.0, 0.999),
+        )
+        self.diffusion_steps = diffusion_steps
+        self.sampling_steps = sampling_steps
+        self.ensemble_size = ensemble_size
+        self.base_weight = base_weight
+        self.uncertainty_weight = uncertainty_weight
+        self.diffusion_weight = diffusion_weight
+        self.recon_weight = recon_weight
+        self.mass_weight = mass_weight
+        self.pde_weight = pde_weight
+        self.smooth_weight = smooth_weight
+        self.wet_threshold = wet_threshold
+        self.eps = 1e-4
+
+        betas = torch.linspace(1e-4, 0.02, diffusion_steps, device=device)
+        alphas = 1.0 - betas
+        self.alpha_bars = torch.cumprod(alphas, dim=0)
+
+    def _alpha_bar(self, timestep: torch.Tensor) -> torch.Tensor:
+        return self.alpha_bars[timestep].view(-1, 1, 1, 1, 1)
+
+    def _sample_timesteps(self, batch_size: int) -> torch.Tensor:
+        return torch.randint(0, self.diffusion_steps, (batch_size,), device=self.device)
+
+    def _q_sample(
+        self,
+        clean: torch.Tensor,
+        timestep: torch.Tensor,
+        noise: torch.Tensor,
+    ) -> torch.Tensor:
+        alpha_bar = self._alpha_bar(timestep)
+        return alpha_bar.sqrt() * clean + (1.0 - alpha_bar).sqrt() * noise
+
+    def _predict_clean(
+        self,
+        noisy: torch.Tensor,
+        timestep: torch.Tensor,
+        predicted_noise: torch.Tensor,
+    ) -> torch.Tensor:
+        alpha_bar = self._alpha_bar(timestep)
+        return (noisy - (1.0 - alpha_bar).sqrt() * predicted_noise) / alpha_bar.sqrt().clamp_min(1e-6)
+
+    def train_step(self, x: torch.Tensor, y: torch.Tensor) -> dict[str, float]:
+        self.model.train()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        with self.autocast():
+            raw_model = _raw_model(self.model)
+            with torch.no_grad():
+                detached_base = raw_model.base_forward(x)
+                normalized_residual = (
+                    (y - detached_base["y_base"]) / detached_base["u_map"].clamp_min(self.eps)
+                ).clamp(-8.0, 8.0)
+            timestep = self._sample_timesteps(x.shape[0])
+            noise = torch.randn_like(normalized_residual)
+            noisy_residual = self._q_sample(normalized_residual, timestep, noise)
+            model_outputs = self.model(x, noisy_residual, timestep)
+            y_base = model_outputs["y_base"]
+            u_map = model_outputs["u_map"]
+            predicted_noise = model_outputs["predicted_noise"]
+            clean_residual = self._predict_clean(noisy_residual, timestep, predicted_noise).clamp(-8.0, 8.0)
+            prediction = torch.clamp(y_base + u_map * clean_residual, min=0.0)
+
+            base_loss = base_reconstruction_loss(y_base, y)
+            unc_loss = uncertainty_loss(u_map, y_base, y)
+            diff_loss = diffusion_noise_loss(predicted_noise, noise)
+            recon_loss = weighted_wet_l1_loss(prediction, y, wet_threshold=self.wet_threshold)
+            mass_loss = mass_conservation_loss(prediction, x)
+            pde_loss = pde_residual_loss(
+                prediction,
+                model_outputs["v_field"],
+                model_outputs["s_field"],
+                model_outputs["p_rain"],
+                wet_threshold=self.wet_threshold,
+            )
+            smooth_loss = smoothness_loss(model_outputs["v_field"], model_outputs["s_field"])
+            loss = (
+                self.base_weight * base_loss
+                + self.uncertainty_weight * unc_loss
+                + self.diffusion_weight * diff_loss
+                + self.recon_weight * recon_loss
+                + self.mass_weight * mass_loss
+                + self.pde_weight * pde_loss
+                + self.smooth_weight * smooth_loss
+            )
+
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        return {
+            "loss": float(loss.detach().cpu()),
+            "base": float(base_loss.detach().cpu()),
+            "diff": float(diff_loss.detach().cpu()),
+            "recon": float(recon_loss.detach().cpu()),
+            "mass": float(mass_loss.detach().cpu()),
+            "pde": float(pde_loss.detach().cpu()),
+        }
+
+    def _ddim_sample(
+        self,
+        x: torch.Tensor,
+        seed: int,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        model = _raw_model(self.model)
+        model.eval()
+        generator = torch.Generator(device=x.device).manual_seed(seed)
+        base_outputs = model.base_forward(x)
+        residual = torch.randn(
+            base_outputs["y_base"].shape,
+            device=x.device,
+            dtype=x.dtype,
+            generator=generator,
+        )
+        timesteps = torch.linspace(
+            self.diffusion_steps - 1,
+            0,
+            self.sampling_steps,
+            device=x.device,
+        ).long()
+        for index, timestep_value in enumerate(timesteps):
+            timestep = timestep_value.repeat(x.shape[0])
+            predicted_noise = model.predict_noise(x, residual, timestep, base_outputs)
+            clean = self._predict_clean(residual, timestep, predicted_noise).clamp(-8.0, 8.0)
+            if index == len(timesteps) - 1:
+                residual = clean
+            else:
+                next_timestep = timesteps[index + 1].repeat(x.shape[0])
+                next_alpha = self._alpha_bar(next_timestep)
+                residual = next_alpha.sqrt() * clean + (1.0 - next_alpha).sqrt() * predicted_noise
+        prediction = torch.clamp(base_outputs["y_base"] + base_outputs["u_map"] * residual, min=0.0)
+        return prediction, base_outputs
+
+    @staticmethod
+    def _crps(samples: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        first = (samples - target.unsqueeze(0)).abs().mean()
+        pairwise = (samples[:, None] - samples[None]).abs().mean()
+        return first - 0.5 * pairwise
+
+    def validation_step(
+        self, x: torch.Tensor, y: torch.Tensor, seed: int
+    ) -> tuple[dict[str, float], torch.Tensor]:
+        predictions = []
+        last_base_outputs = None
+        with torch.no_grad(), self.autocast():
+            for member_index in range(self.ensemble_size):
+                prediction, base_outputs = self._ddim_sample(x, seed + member_index)
+                predictions.append(prediction)
+                last_base_outputs = base_outputs
+            samples = torch.stack(predictions, dim=0)
+            prediction = samples.mean(dim=0)
+            mae = F.l1_loss(prediction, y)
+            mse = F.mse_loss(prediction, y)
+            rmse = torch.sqrt(mse)
+            bias = (prediction - y).mean()
+            wet_mask = y > self.wet_threshold
+            wet_mae = (prediction[wet_mask] - y[wet_mask]).abs().mean() if wet_mask.any() else mae
+            crps = self._crps(samples, y)
+            pde = pde_residual_loss(
+                prediction,
+                last_base_outputs["v_field"],
+                last_base_outputs["s_field"],
+                last_base_outputs["p_rain"],
+                wet_threshold=self.wet_threshold,
+            )
+        return {
+            "val_mae": float(mae.cpu()),
+            "val_mse": float(mse.cpu()),
+            "val_rmse": float(rmse.cpu()),
+            "val_bias": float(bias.cpu()),
+            "val_wet_mae": float(wet_mae.cpu()),
+            "val_crps": float(crps.cpu()),
+            "val_pde": float(pde.cpu()),
+        }, prediction
+
+    def visualization_prediction(self, x: torch.Tensor, seed: int) -> torch.Tensor:
+        with torch.no_grad():
+            prediction, _ = self._ddim_sample(torch.clamp(x, min=0.0), seed)
+        return prediction
+
+    def checkpoint_state(self) -> dict:
+        return {
+            "model": _raw_model(self.model).state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+        }
+
+    def inference_state(self) -> dict[str, torch.Tensor]:
+        return _raw_model(self.model).state_dict()
+
+
 def build_training_method(method_name: str, device: torch.device, config) -> TrainingMethod:
     """根据配置创建训练方法"""
 
+    if method_name == "era5_trilinear":
+        return ERA5InterpolationMethod(
+            device=device,
+            mode="trilinear",
+            wet_threshold=config.wet_threshold,
+        )
+    if method_name == "era5_nearest":
+        return ERA5InterpolationMethod(
+            device=device,
+            mode="nearest",
+            wet_threshold=config.wet_threshold,
+        )
     if method_name == "gan":
         return AdversarialGANMethod(
             device=device,
@@ -297,6 +689,32 @@ def build_training_method(method_name: str, device: torch.device, config) -> Tra
         return CNNMethod(
             device=device,
             lr=config.generator_lr,
+            use_ddp=getattr(config, "distributed", False),
+        )
+    if method_name == "st_resunet":
+        return STResUNetMethod(
+            device=device,
+            lr=config.generator_lr,
+            base_channels=config.base_channels,
+            wet_threshold=config.wet_threshold,
+            use_ddp=getattr(config, "distributed", False),
+        )
+    if method_name == "pg_erd":
+        return PGERDMethod(
+            device=device,
+            lr=config.generator_lr,
+            base_channels=config.base_channels,
+            diffusion_steps=config.diffusion_steps,
+            sampling_steps=config.sampling_steps,
+            ensemble_size=config.ensemble_size,
+            base_weight=config.base_weight,
+            uncertainty_weight=config.uncertainty_weight,
+            diffusion_weight=config.diffusion_weight,
+            recon_weight=config.recon_weight,
+            mass_weight=config.mass_weight,
+            pde_weight=config.pde_weight,
+            smooth_weight=config.smooth_weight,
+            wet_threshold=config.wet_threshold,
             use_ddp=getattr(config, "distributed", False),
         )
     raise ValueError(f"未知 training_method: {method_name}")

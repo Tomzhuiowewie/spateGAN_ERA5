@@ -12,6 +12,7 @@ import random
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
+from torch.utils.data import Subset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
@@ -52,10 +53,23 @@ class TrainingConfig:
     num_workers: int = 0
     load_into_memory: bool = False
     dataset_cache_size: int = 16
+    train_fraction: float = 1.0
+    subset_seed: int = 42
     generator_lr: float = 1e-4
     discriminator_lr: float = 2e-4
     l1_weight: float = 1.0
     ensemble_size: int = 3
+    base_channels: int = 32
+    diffusion_steps: int = 1000
+    sampling_steps: int = 5
+    base_weight: float = 1.0
+    uncertainty_weight: float = 0.1
+    diffusion_weight: float = 1.0
+    recon_weight: float = 0.1
+    mass_weight: float = 0.05
+    pde_weight: float = 0.01
+    smooth_weight: float = 0.005
+    wet_threshold: float = 0.1
 
 
 class Trainer:
@@ -86,7 +100,7 @@ class Trainer:
         torch.manual_seed(config.seed + self.rank)
         random.seed(config.seed + self.rank)
 
-        self.dataset = PairedPatchDataset(
+        full_train_dataset = PairedPatchDataset(
             config.x_path,
             config.y_path,
             x_pattern=config.x_pattern,
@@ -98,6 +112,7 @@ class Trainer:
             dataset_cache_size=config.dataset_cache_size,
             seed=config.seed,
         )
+        self.dataset = self._maybe_subset_dataset(full_train_dataset)
         self.train_sampler = (
             DistributedSampler(
                 self.dataset,
@@ -166,6 +181,19 @@ class Trainer:
     def _distributed_barrier(self) -> None:
         if self.distributed and dist.is_initialized():
             dist.barrier()
+
+    def _maybe_subset_dataset(self, dataset: PairedPatchDataset):
+        fraction = self.config.train_fraction
+        if not 0 < fraction <= 1:
+            raise ValueError(f"train_fraction must be in (0, 1], got {fraction}")
+        if fraction == 1:
+            return dataset
+
+        sample_count = max(1, int(round(len(dataset) * fraction)))
+        generator = torch.Generator().manual_seed(self.config.subset_seed)
+        indices = torch.randperm(len(dataset), generator=generator)[:sample_count].tolist()
+        indices.sort()
+        return Subset(dataset, indices)
 
     def train(self) -> None:
         step = 0
@@ -477,7 +505,22 @@ class Trainer:
             return
 
         figure, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
-        train_keys = [key for key in ("d_loss", "g_loss", "g_adv", "g_l1", "loss") if key in train_rows[0]]
+        train_keys = [
+            key
+            for key in (
+                "d_loss",
+                "g_loss",
+                "g_adv",
+                "g_l1",
+                "loss",
+                "base",
+                "diff",
+                "recon",
+                "mass",
+                "pde",
+            )
+            if key in train_rows[0]
+        ]
         for key in train_keys:
             axes[0].plot(
                 [float(row["step"]) for row in train_rows],

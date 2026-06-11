@@ -425,3 +425,192 @@ class CNNDownscaler(nn.Module):
         x = self.encoder(x)
         x = self.upsample(x)
         return self.decoder(x)
+
+
+class GroupNorm3D(nn.Module):
+    """小 batch 训练更稳定的 3D GroupNorm。"""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        groups = min(8, channels)
+        while channels % groups != 0:
+            groups -= 1
+        self.norm = nn.GroupNorm(groups, channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x)
+
+
+class LightResidualBlock3D(nn.Module):
+    """轻量 3D 残差块，用于全尺寸训练。"""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            GroupNorm3D(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1),
+            GroupNorm3D(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """扩散时间步的位置编码。"""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        half = self.dim // 2
+        scale = torch.log(torch.tensor(10000.0, device=timesteps.device)) / max(half - 1, 1)
+        freqs = torch.exp(torch.arange(half, device=timesteps.device) * -scale)
+        args = timesteps.float()[:, None] * freqs[None]
+        embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=1)
+        if self.dim % 2 == 1:
+            embedding = F.pad(embedding, (0, 1))
+        return embedding
+
+
+class PGBaseNet(nn.Module):
+    """PG-ERD 的确定性基础预测器。
+
+    输出:
+        y_base: 基础降水预测
+        u_map: 误差尺度图
+        p_rain: 降水概率图
+        v_field: 平流速度场
+        s_field: 源汇场
+    """
+
+    def __init__(self, base_channels: int = 32) -> None:
+        super().__init__()
+        c = base_channels
+        self.low_encoder = nn.Sequential(
+            nn.Conv3d(3, c, kernel_size=3, padding=1),
+            LightResidualBlock3D(c),
+            LightResidualBlock3D(c),
+        )
+        self.upsample = nn.Upsample(
+            scale_factor=(3, 6, 6),
+            mode="trilinear",
+            align_corners=False,
+        )
+        self.high_decoder = nn.Sequential(
+            nn.Conv3d(c, c, kernel_size=3, padding=1),
+            LightResidualBlock3D(c),
+            LightResidualBlock3D(c),
+        )
+        self.y_head = nn.Sequential(nn.Conv3d(c, 1, kernel_size=3, padding=1), nn.Softplus())
+        self.u_head = nn.Sequential(nn.Conv3d(c, 1, kernel_size=3, padding=1), nn.Softplus())
+        self.rain_head = nn.Conv3d(c, 1, kernel_size=3, padding=1)
+        self.v_head = nn.Conv3d(c, 2, kernel_size=3, padding=1)
+        self.s_head = nn.Conv3d(c, 1, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        total = x.sum(dim=1, keepdim=True)
+        features = self.low_encoder(torch.cat([x, total], dim=1))
+        features = self.upsample(features)
+        features = self.high_decoder(features)
+        return {
+            "y_base": self.y_head(features),
+            "u_map": self.u_head(features) + 1e-3,
+            "p_rain": torch.sigmoid(self.rain_head(features)),
+            "v_field": torch.tanh(self.v_head(features)),
+            "s_field": self.s_head(features),
+            "features": features,
+        }
+
+
+class ResidualDiffusionNet3D(nn.Module):
+    """条件残差扩散去噪网络。"""
+
+    def __init__(self, base_channels: int = 32, diffusion_steps: int = 1000) -> None:
+        super().__init__()
+        c = base_channels
+        self.diffusion_steps = diffusion_steps
+        self.time_embedding = nn.Sequential(
+            SinusoidalTimeEmbedding(c),
+            nn.Linear(c, c),
+            nn.SiLU(inplace=True),
+            nn.Linear(c, c),
+        )
+        self.condition_encoder = nn.Sequential(
+            nn.Conv3d(3, c, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            LightResidualBlock3D(c),
+        )
+        self.input = nn.Conv3d(5, c, kernel_size=3, padding=1)
+        self.blocks = nn.Sequential(
+            LightResidualBlock3D(c),
+            LightResidualBlock3D(c),
+            LightResidualBlock3D(c),
+        )
+        self.output = nn.Conv3d(c, 1, kernel_size=3, padding=1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        noisy_residual: torch.Tensor,
+        timestep: torch.Tensor,
+        y_base: torch.Tensor,
+        u_map: torch.Tensor,
+        p_rain: torch.Tensor,
+    ) -> torch.Tensor:
+        x_high = F.interpolate(
+            torch.cat([x, x.sum(dim=1, keepdim=True)], dim=1),
+            size=noisy_residual.shape[2:],
+            mode="trilinear",
+            align_corners=False,
+        )
+        condition = self.condition_encoder(x_high)
+        h = self.input(torch.cat([noisy_residual, y_base, u_map, p_rain, x_high[:, 2:3]], dim=1))
+        time = self.time_embedding(timestep).view(timestep.shape[0], -1, 1, 1, 1)
+        h = h + condition + time
+        return self.output(self.blocks(h))
+
+
+class PGERDDownscaler(nn.Module):
+    """全尺寸 PG-ERD 模型。"""
+
+    def __init__(self, base_channels: int = 32, diffusion_steps: int = 1000) -> None:
+        super().__init__()
+        self.base = PGBaseNet(base_channels=base_channels)
+        self.diffusion = ResidualDiffusionNet3D(
+            base_channels=base_channels,
+            diffusion_steps=diffusion_steps,
+        )
+
+    def base_forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self.base(x)
+
+    def predict_noise(
+        self,
+        x: torch.Tensor,
+        noisy_residual: torch.Tensor,
+        timestep: torch.Tensor,
+        base_outputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        return self.diffusion(
+            x=x,
+            noisy_residual=noisy_residual,
+            timestep=timestep,
+            y_base=base_outputs["y_base"],
+            u_map=base_outputs["u_map"],
+            p_rain=base_outputs["p_rain"],
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        noisy_residual: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        base_outputs = self.base_forward(x)
+        predicted_noise = self.predict_noise(x, noisy_residual, timestep, base_outputs)
+        return {**base_outputs, "predicted_noise": predicted_noise}
